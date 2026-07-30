@@ -28,6 +28,7 @@ import {
   serializeProgress,
   type TimeRollProgressV2,
 } from "./timeRollProgress";
+import { robotMeshYaw, segmentTransform } from "./timeRollVisualMath";
 
 type ThemeId = "manufacturing" | "construction" | "transport" | "communication" | "life";
 type GameMode = "intro" | "playing" | "paused" | "eraClear" | "victory" | "timeUp";
@@ -200,6 +201,9 @@ declare global {
       completeEra: () => void;
       nextEra: () => void;
       retry: () => void;
+      setCameraHeading: (headingRadians: number) => void;
+      setCameraPose: (eye: Vec3, target: Vec3, fovDegrees?: number) => void;
+      setPlayerPosition: (x: number, z: number) => void;
       getState: () => string;
     };
   }
@@ -220,16 +224,20 @@ const THEME_BY_ID = Object.fromEntries(THEMES.map((theme) => [theme.id, theme]))
 
 const SKIN_BY_THEME: Record<ThemeId, number> = {
   manufacturing: 1,
-  construction: 3,
-  transport: 4,
-  communication: 5,
-  life: 6,
+  construction: 14,
+  transport: 16,
+  communication: 18,
+  life: 21,
 };
 
-const ERA_GROUND_SKINS = [2, 2, 4, 5, 6] as const;
+const ERA_GROUND_SKINS = [24, 13, 15, 5, 23] as const;
 
-const OBJECT_ATLAS_COLUMNS = 5;
-const OBJECT_VARIANTS_PER_THEME = 10;
+const MATERIAL_ATLAS_TILE_COUNT = 25;
+const OBJECT_GEOMETRY_FAMILY_COUNT = 5;
+const OBJECT_ATLAS_PRIMARY_TILE_COUNT = 50;
+const OBJECT_ATLAS_ENVIRONMENT_TILE_COUNT = 50;
+const OBJECT_VARIANTS_PER_THEME = 20;
+const FACADE_ATLAS_TILE_COUNT = 25;
 const THEME_INDEX: Record<ThemeId, number> = {
   manufacturing: 0,
   construction: 1,
@@ -447,11 +455,11 @@ function updateCamera(camera: CameraState, state: GameState, dt: number) {
     Math.max(base * base * 42, 0.01);
   const desiredBank = state.reducedMotion
     ? 0
-    : clamp(turnImpulse * 2.8 + headingDelta * 0.8, -1, 1) * 0.22;
+    : clamp(turnImpulse * 2.1 + headingDelta * 0.58, -1, 1) * 0.105;
   const bankResponse =
     Math.abs(desiredBank) > Math.abs(camera.bank)
-      ? 1 - Math.pow(0.0008, dt)
-      : 1 - Math.pow(0.58, dt);
+      ? 1 - Math.pow(0.002, dt)
+      : 1 - Math.pow(0.006, dt);
   camera.bank = mix(camera.bank, desiredBank, bankResponse);
   camera.previousVx = state.vx;
   camera.previousVz = state.vz;
@@ -467,9 +475,9 @@ function updateCamera(camera: CameraState, state: GameState, dt: number) {
   let height = frameRadius * mix(4.7, 4.25, framingSpeed01);
   let lookAhead = frameRadius * mix(3.8, 6.7, framingSpeed01);
   if (portrait) {
-    distance *= 1.06;
-    height *= 1.22;
-    lookAhead *= 1.18;
+    distance *= 0.94;
+    height *= 1.1;
+    lookAhead *= 1.08;
   }
   const kick = state.reducedMotion ? 0 : state.cameraKick;
   distance += frameRadius * kick * 0.82;
@@ -592,6 +600,7 @@ type GpuMesh = {
 type DrawTextureOptions = {
   skinTile?: number;
   objectTile?: number;
+  facadeTile?: number;
   textureBlend?: number;
   textureScale?: number | [number, number];
 };
@@ -606,6 +615,7 @@ type DrawCommand = {
   gloss: number;
   skinTile: number;
   objectTile: number;
+  facadeTile: number;
   textureBlend: number;
   textureScale: [number, number];
   distanceSquared: number;
@@ -785,10 +795,14 @@ class WebGlToyRenderer {
   private normalScaleLocation: WebGLUniformLocation;
   private materialAtlasLocation: WebGLUniformLocation;
   private objectAtlasLocation: WebGLUniformLocation;
+  private objectEnvironmentAtlasLocation: WebGLUniformLocation;
+  private facadeAtlasLocation: WebGLUniformLocation;
   private atlasLoadedLocation: WebGLUniformLocation;
   private objectAtlasLoadedLocation: WebGLUniformLocation;
+  private facadeAtlasLoadedLocation: WebGLUniformLocation;
   private skinTileLocation: WebGLUniformLocation;
   private objectTileLocation: WebGLUniformLocation;
+  private facadeTileLocation: WebGLUniformLocation;
   private textureBlendLocation: WebGLUniformLocation;
   private textureScaleLocation: WebGLUniformLocation;
   private viewProjection: Mat4 = new Float32Array(16);
@@ -796,8 +810,12 @@ class WebGlToyRenderer {
   private lowQuality: boolean;
   private materialAtlas: WebGLTexture;
   private objectAtlas: WebGLTexture;
+  private objectEnvironmentAtlas: WebGLTexture;
+  private facadeAtlas: WebGLTexture;
   private materialAtlasLoaded = false;
   private objectAtlasLoaded = false;
+  private objectEnvironmentAtlasLoaded = false;
+  private facadeAtlasLoaded = false;
   private transparentCommands: DrawCommand[] = [];
   private cameraEye: Vec3 = [0, 0, 0];
   private renderStats: RenderStats = {
@@ -860,35 +878,69 @@ class WebGlToyRenderer {
         uniform float uGloss;
         uniform sampler2D uMaterialAtlas;
         uniform sampler2D uObjectAtlas;
+        uniform sampler2D uObjectEnvironmentAtlas;
+        uniform sampler2D uFacadeAtlas;
         uniform bool uAtlasLoaded;
         uniform bool uObjectAtlasLoaded;
+        uniform bool uFacadeAtlasLoaded;
         uniform float uSkinTile;
         uniform float uObjectTile;
+        uniform float uFacadeTile;
         uniform float uTextureBlend;
         uniform vec2 uTextureScale;
 
         vec3 atlasColor() {
-          float tile = clamp(floor(uSkinTile + 0.5), 0.0, 8.0);
-          float column = mod(tile, 3.0);
-          float row = floor(tile / 3.0);
+          float tile = clamp(floor(uSkinTile + 0.5), 0.0, 24.0);
+          float column = mod(tile, 5.0);
+          float row = floor(tile / 5.0);
           vec2 safeUv = mix(vec2(0.015), vec2(0.985), fract(vUv * max(uTextureScale, vec2(0.0001))));
-          vec2 atlasUv = (vec2(column, row) + safeUv) / 3.0;
+          vec2 atlasUv = (vec2(column, row) + safeUv) / 5.0;
           return texture2D(uMaterialAtlas, atlasUv).rgb;
         }
 
-        vec4 objectAtlasColor() {
-          float tile = clamp(floor(uObjectTile + 0.5), 0.0, 24.0);
-          float column = mod(tile, 5.0);
-          float row = floor(tile / 5.0);
-          vec2 safeUv = mix(vec2(0.026), vec2(0.974), vUv);
-          vec2 atlasUv = (vec2(column, row) + safeUv) / 5.0;
-          vec4 sampled = texture2D(uObjectAtlas, atlasUv);
-          bool isMagentaKey = sampled.r > 0.86 && sampled.b > 0.86 && sampled.g < 0.22 && abs(sampled.r - sampled.b) < 0.18;
+        vec4 chromaKey(vec4 sampled) {
+          float magentaDistance = distance(sampled.rgb, vec3(1.0, 0.0, 1.0));
+          bool isMagentaKey =
+            magentaDistance < 0.38 ||
+            (
+              sampled.r > 0.54 &&
+              sampled.b > 0.45 &&
+              sampled.g < 0.30 &&
+              sampled.r + sampled.b > 1.08 &&
+              abs(sampled.r - sampled.b) < 0.34
+            );
           if (isMagentaKey) discard;
           return sampled;
         }
 
+        vec4 objectAtlasColor() {
+          float tile = clamp(floor(uObjectTile + 0.5), 0.0, 99.0);
+          float theme = floor(tile / 20.0);
+          float kind = mod(tile, 20.0);
+          vec2 safeUv = mix(vec2(0.026), vec2(0.974), vUv);
+          if (kind < 10.0) {
+            vec2 atlasUv = (vec2(kind, theme) + safeUv) / vec2(10.0, 5.0);
+            return chromaKey(texture2D(uObjectAtlas, atlasUv));
+          }
+          vec2 atlasUv = (vec2(kind - 10.0, theme) + safeUv) / vec2(10.0, 5.0);
+          return chromaKey(texture2D(uObjectEnvironmentAtlas, atlasUv));
+        }
+
+        vec4 facadeAtlasColor() {
+          float tile = clamp(floor(uFacadeTile + 0.5), 0.0, 24.0);
+          float column = mod(tile, 5.0);
+          float row = floor(tile / 5.0);
+          vec2 safeUv = mix(vec2(0.026), vec2(0.974), vUv);
+          vec2 atlasUv = (vec2(column, row) + safeUv) / 5.0;
+          return chromaKey(texture2D(uFacadeAtlas, atlasUv));
+        }
+
         void main() {
+          if (uFacadeAtlasLoaded && uFacadeTile >= 0.0) {
+            vec4 decal = facadeAtlasColor();
+            gl_FragColor = vec4(decal.rgb, decal.a * uAlpha);
+            return;
+          }
           if (uObjectAtlasLoaded && uObjectTile >= 0.0) {
             vec4 decal = objectAtlasColor();
             gl_FragColor = vec4(decal.rgb, decal.a * uAlpha);
@@ -955,14 +1007,20 @@ class WebGlToyRenderer {
     this.normalScaleLocation = this.uniform("uNormalScale");
     this.materialAtlasLocation = this.uniform("uMaterialAtlas");
     this.objectAtlasLocation = this.uniform("uObjectAtlas");
+    this.objectEnvironmentAtlasLocation = this.uniform("uObjectEnvironmentAtlas");
+    this.facadeAtlasLocation = this.uniform("uFacadeAtlas");
     this.atlasLoadedLocation = this.uniform("uAtlasLoaded");
     this.objectAtlasLoadedLocation = this.uniform("uObjectAtlasLoaded");
+    this.facadeAtlasLoadedLocation = this.uniform("uFacadeAtlasLoaded");
     this.skinTileLocation = this.uniform("uSkinTile");
     this.objectTileLocation = this.uniform("uObjectTile");
+    this.facadeTileLocation = this.uniform("uFacadeTile");
     this.textureBlendLocation = this.uniform("uTextureBlend");
     this.textureScaleLocation = this.uniform("uTextureScale");
     this.materialAtlas = this.createMaterialAtlasTexture();
     this.objectAtlas = this.createObjectAtlasTexture();
+    this.objectEnvironmentAtlas = this.createObjectEnvironmentAtlasTexture();
+    this.facadeAtlas = this.createFacadeAtlasTexture();
     this.meshes = {
       cube: this.upload(makeCube()),
       sphere: this.upload(lowQuality ? makeSphere(9, 14) : makeSphere(14, 22)),
@@ -995,14 +1053,26 @@ class WebGlToyRenderer {
   }
 
   private createMaterialAtlasTexture() {
-    return this.createTexture("/textures/time-roll-material-atlas.jpg", () => {
+    return this.createTexture("/textures/time-roll-material-atlas-5x5.png", () => {
       this.materialAtlasLoaded = true;
     }, false);
   }
 
   private createObjectAtlasTexture() {
-    return this.createTexture("/textures/time-roll-object-atlas.png", () => {
+    return this.createTexture("/textures/time-roll-object-atlas-10x5.png", () => {
       this.objectAtlasLoaded = true;
+    }, true);
+  }
+
+  private createObjectEnvironmentAtlasTexture() {
+    return this.createTexture("/textures/time-roll-object-atlas-environment-10x5.png", () => {
+      this.objectEnvironmentAtlasLoaded = true;
+    }, true);
+  }
+
+  private createFacadeAtlasTexture() {
+    return this.createTexture("/textures/time-roll-facade-atlas-5x5.png", () => {
+      this.facadeAtlasLoaded = true;
     }, true);
   }
 
@@ -1120,8 +1190,18 @@ class WebGlToyRenderer {
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, this.objectAtlas);
     gl.uniform1i(this.objectAtlasLocation, 1);
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, this.objectEnvironmentAtlas);
+    gl.uniform1i(this.objectEnvironmentAtlasLocation, 2);
+    gl.activeTexture(gl.TEXTURE3);
+    gl.bindTexture(gl.TEXTURE_2D, this.facadeAtlas);
+    gl.uniform1i(this.facadeAtlasLocation, 3);
     gl.uniform1i(this.atlasLoadedLocation, this.materialAtlasLoaded ? 1 : 0);
-    gl.uniform1i(this.objectAtlasLoadedLocation, this.objectAtlasLoaded ? 1 : 0);
+    gl.uniform1i(
+      this.objectAtlasLoadedLocation,
+      this.objectAtlasLoaded && this.objectEnvironmentAtlasLoaded ? 1 : 0,
+    );
+    gl.uniform1i(this.facadeAtlasLoadedLocation, this.facadeAtlasLoaded ? 1 : 0);
   }
 
   draw(
@@ -1141,8 +1221,21 @@ class WebGlToyRenderer {
       typeof texture === "number"
         ? { skinTile: texture, textureBlend, textureScale }
         : texture;
-    const skinTile = clamp(Math.round(textureOptions.skinTile ?? -1), -1, 8);
-    const objectTile = clamp(Math.round(textureOptions.objectTile ?? -1), -1, 24);
+    const skinTile = clamp(
+      Math.round(textureOptions.skinTile ?? -1),
+      -1,
+      MATERIAL_ATLAS_TILE_COUNT - 1,
+    );
+    const objectTile = clamp(
+      Math.round(textureOptions.objectTile ?? -1),
+      -1,
+      OBJECT_ATLAS_PRIMARY_TILE_COUNT + OBJECT_ATLAS_ENVIRONMENT_TILE_COUNT - 1,
+    );
+    const facadeTile = clamp(
+      Math.round(textureOptions.facadeTile ?? -1),
+      -1,
+      FACADE_ATLAS_TILE_COUNT - 1,
+    );
     const scaleValue = textureOptions.textureScale ?? 1;
     const resolvedTextureScale: [number, number] =
       typeof scaleValue === "number" ? [scaleValue, scaleValue] : scaleValue;
@@ -1156,6 +1249,7 @@ class WebGlToyRenderer {
       gloss,
       skinTile,
       objectTile,
+      facadeTile,
       textureBlend: clamp(textureOptions.textureBlend ?? (skinTile >= 0 ? 1 : 0), 0, 1),
       textureScale: [
         Math.max(resolvedTextureScale[0], 0.0001),
@@ -1184,6 +1278,26 @@ class WebGlToyRenderer {
       alpha,
       1,
       { objectTile: tile, textureBlend: 0 },
+    );
+  }
+
+  drawFacadeDecal(
+    tile: number,
+    position: Vec3,
+    width: number,
+    height: number,
+    yaw: number,
+    alpha = 1,
+  ) {
+    this.draw(
+      "plane",
+      [1, 1, 1],
+      position,
+      [width, height, 1],
+      [0, yaw, 0],
+      alpha,
+      1,
+      { facadeTile: tile, textureBlend: 0 },
     );
   }
 
@@ -1232,6 +1346,7 @@ class WebGlToyRenderer {
     gl.uniform1f(this.glossLocation, command.gloss);
     gl.uniform1f(this.skinTileLocation, command.skinTile);
     gl.uniform1f(this.objectTileLocation, command.objectTile);
+    gl.uniform1f(this.facadeTileLocation, command.facadeTile);
     gl.uniform1f(this.textureBlendLocation, command.textureBlend);
     gl.uniform2fv(this.textureScaleLocation, command.textureScale);
     gl.uniform3fv(this.normalScaleLocation, [
@@ -1266,7 +1381,7 @@ function objectKindFor(theme: ThemeId, sequence: number) {
 }
 
 function decalTileFor(theme: ThemeId, objectKind: number) {
-  return THEME_INDEX[theme] * OBJECT_ATLAS_COLUMNS + (objectKind % OBJECT_ATLAS_COLUMNS);
+  return THEME_INDEX[theme] * OBJECT_VARIANTS_PER_THEME + (objectKind % OBJECT_VARIANTS_PER_THEME);
 }
 
 function otherFocusTheme(theme: ThemeId): ThemeId {
@@ -1621,6 +1736,13 @@ function drawToyTree(
   );
   const leafA: Vec3 = [0.35, 0.82, 0.45];
   const leafB: Vec3 = [0.62, 0.91, 0.48];
+  const secondaryCrown = rotateGroundPoint(
+    x,
+    z,
+    phase,
+    -scale * 0.48,
+    scale * 0.05,
+  );
   renderer.draw(
     "sphere",
     leafA,
@@ -1634,9 +1756,9 @@ function drawToyTree(
   renderer.draw(
     "sphere",
     leafB,
-    [x - scale * 0.48, scale * 1.83, z + scale * 0.05],
+    [secondaryCrown[0], scale * 1.83, secondaryCrown[1]],
     [scale * 0.7, scale * 0.68, scale * 0.72],
-    [0, -phase, 0],
+    [0, phase, 0],
     1,
     0.22,
     { skinTile: 6, textureBlend: 0.52 },
@@ -1650,7 +1772,7 @@ function drawPathTile(
   width: number,
   length: number,
   yaw: number,
-  _skinTile: number,
+  skinTile: number,
   color: Vec3,
 ) {
   const tileLength = length * 0.88;
@@ -1672,6 +1794,7 @@ function drawPathTile(
     [0, yaw, 0],
     1,
     0.16,
+    { skinTile, textureBlend: 0.76, textureScale: [1.2, Math.max(1.2, length / width)] },
   );
 }
 
@@ -1701,6 +1824,26 @@ function drawEraLandmark(
   const focus = THEMES[eraIndex].color;
   const dark = mixColor(focus, [0.10, 0.16, 0.18], 0.45);
   const light = mixColor(focus, [1, 0.96, 0.78], 0.5);
+  const localPoint = (localX: number, localZ: number, height: number): Vec3 => {
+    const point = rotateGroundPoint(x, z, yaw, localX * scale, localZ * scale);
+    return [point[0], height * scale, point[1]];
+  };
+  const drawFrontFacade = (
+    tile: number,
+    localX: number,
+    localZ: number,
+    height: number,
+    width: number,
+    facadeHeight: number,
+  ) => {
+    renderer.drawFacadeDecal(
+      tile,
+      localPoint(localX, localZ, height),
+      width * scale,
+      facadeHeight * scale,
+      yaw,
+    );
+  };
   drawContactShadow(renderer, x, z, scale * 1.05, 0.18, yaw);
 
   if (eraIndex === 0) {
@@ -1714,7 +1857,7 @@ function drawEraLandmark(
         [0, yaw, 0],
         1,
         0.16,
-        { skinTile: 1, textureBlend: 0.76, textureScale: [1.5, 1.2] },
+        { skinTile: 11, textureBlend: 0.9, textureScale: [1.5, 1.2] },
       );
       renderer.draw(
         "cone",
@@ -1724,44 +1867,43 @@ function drawEraLandmark(
         [0, yaw, 0],
         1,
         0.15,
-        { skinTile: 2, textureBlend: 0.7, textureScale: 1.4 },
+        { skinTile: 10, textureBlend: 0.9, textureScale: 1.4 },
       );
-      const door = rotateGroundPoint(x, z, yaw, 0, -scale * 0.66);
-      renderer.draw(
-        "cube",
-        dark,
-        [door[0], scale * 0.46, door[1]],
-        [scale * 0.36, scale * 0.72, scale * 0.1],
-        [0, yaw, 0],
-        1,
-        0.24,
-        { skinTile: 1, textureBlend: 0.9 },
-      );
-      renderer.draw("sphere", [1, 0.78, 0.22], [door[0] + scale * 0.11, scale * 0.48, door[1] - scale * 0.07], [scale * 0.06, scale * 0.06, scale * 0.06], [0, 0, 0], 1, 0.9);
+      drawFrontFacade(0, 0.18, -0.653, 0.52, 0.52, 0.84);
+      drawFrontFacade(1, -0.43, -0.653, 0.7, 0.42, 0.5);
+      drawFrontFacade(0, -0.18, 0.653, 0.52, 0.52, 0.84);
+      drawFrontFacade(1, 0.43, 0.653, 0.7, 0.42, 0.5);
       const chimney = rotateGroundPoint(x, z, yaw, scale * 0.46, scale * 0.18);
-      renderer.draw("cylinder", [0.72, 0.4, 0.28], [chimney[0], scale * 1.42, chimney[1]], [scale * 0.18, scale * 0.64, scale * 0.18], [0, yaw, 0], 1, 0.18, { skinTile: 2, textureBlend: 0.78 });
+      renderer.draw("cylinder", [0.72, 0.4, 0.28], [chimney[0], scale * 1.42, chimney[1]], [scale * 0.18, scale * 0.64, scale * 0.18], [0, yaw, 0], 1, 0.18, { skinTile: 12, textureBlend: 0.9 });
     } else {
-      renderer.draw("cylinder", [0.92, 0.76, 0.5], [x, scale * 0.82, z], [scale * 0.58, scale * 1.64, scale * 0.58], [0, yaw, 0], 1, 0.18, { skinTile: 1, textureBlend: 0.84, textureScale: [1, 2] });
-      renderer.draw("cone", [0.94, 0.62, 0.34], [x, scale * 1.78, z], [scale * 0.72, scale * 0.72, scale * 0.72], [0, yaw, 0], 1, 0.2, { skinTile: 2, textureBlend: 0.74 });
+      renderer.draw("cylinder", [0.92, 0.76, 0.5], [x, scale * 0.82, z], [scale * 0.58, scale * 1.64, scale * 0.58], [0, yaw, 0], 1, 0.18, { skinTile: 9, textureBlend: 0.9, textureScale: [1, 2] });
+      renderer.draw("cone", [0.94, 0.62, 0.34], [x, scale * 1.78, z], [scale * 0.72, scale * 0.72, scale * 0.72], [0, yaw, 0], 1, 0.2, { skinTile: 10, textureBlend: 0.9 });
       const wheel = rotateGroundPoint(x, z, yaw, 0, -scale * 0.64);
       renderer.draw("cylinder", [0.98, 0.84, 0.46], [wheel[0], scale * 1.14, wheel[1]], [scale * 0.92, scale * 0.16, scale * 0.92], [Math.PI / 2, yaw, 0], 1, 0.46, { skinTile: 1, textureBlend: 0.9, textureScale: 1.5 });
-      renderer.draw("cylinder", [1, 0.9, 0.52], [wheel[0], scale * 1.14, wheel[1] - scale * 0.11], [scale * 0.18, scale * 0.2, scale * 0.18], [Math.PI / 2, yaw, 0], 1, 0.7, { skinTile: 3, textureBlend: 0.62 });
+      const hub = rotateGroundPoint(x, z, yaw, 0, -scale * 0.75);
+      renderer.draw("cylinder", [1, 0.9, 0.52], [hub[0], scale * 1.14, hub[1]], [scale * 0.18, scale * 0.2, scale * 0.18], [Math.PI / 2, yaw, 0], 1, 0.7, { skinTile: 3, textureBlend: 0.72 });
     }
   } else if (eraIndex === 1) {
-    renderer.draw("cube", dark, [x, scale * 1.35, z], [scale * 0.28, scale * 2.7, scale * 0.28], [0, yaw, 0], 1, 0.45, { skinTile: 3, textureBlend: 0.7, textureScale: [1, 3] });
+    renderer.draw("cube", dark, [x, scale * 1.35, z], [scale * 0.28, scale * 2.7, scale * 0.28], [0, yaw, 0], 1, 0.45, { skinTile: 14, textureBlend: 0.9, textureScale: [1, 3] });
     renderer.draw("cube", [1, 0.9, 0.46], [x, scale * 2.6, z], [scale * 2.2, scale * 0.22, scale * 0.22], [0, yaw, -0.04], 1, 0.5, { skinTile: 3, textureBlend: 0.92, textureScale: [3, 1] });
     const hook = rotateGroundPoint(x, z, yaw, scale * 0.92, 0);
     renderer.draw("cylinder", light, [hook[0], scale * 1.8, hook[1]], [scale * 0.1, scale * 1.35, scale * 0.1]);
-    renderer.draw("cube", [0.92, 0.62, 0.36], [x, scale * 0.32, z], [scale * 1.7, scale * 0.6, scale * 1.25], [0, yaw, 0], 1, 0.18, { skinTile: 2, textureBlend: 0.72, textureScale: [2, 1] });
+    renderer.draw("cube", [0.92, 0.62, 0.36], [x, scale * 0.32, z], [scale * 1.7, scale * 0.6, scale * 1.25], [0, yaw, 0], 1, 0.18, { skinTile: 13, textureBlend: 0.88, textureScale: [2, 1] });
+    drawFrontFacade(9, 0, -0.638, 0.34, 1.18, 0.38);
+    drawFrontFacade(9, 0, 0.638, 0.34, 1.18, 0.38);
   } else if (eraIndex === 2) {
-    renderer.draw("cube", [0.72, 0.88, 1], [x, scale * 0.48, z], [scale * 2.4, scale * 0.9, scale * 1.1], [0, yaw, 0], 1, 0.42, { skinTile: 4, textureBlend: 0.88, textureScale: [2.4, 1] });
-    renderer.draw("cube", [0.83, 0.98, 1], [x, scale * 1.02, z], [scale * 1.25, scale * 0.35, scale * 0.9], [0, yaw, 0], 0.96, 0.82, { skinTile: 7, textureBlend: 0.52 });
+    renderer.draw("cube", [0.72, 0.88, 1], [x, scale * 0.48, z], [scale * 2.4, scale * 0.9, scale * 1.1], [0, yaw, 0], 1, 0.42, { skinTile: 16, textureBlend: 0.92, textureScale: [2.4, 1] });
+    renderer.draw("cube", [0.83, 0.98, 1], [x, scale * 1.02, z], [scale * 1.25, scale * 0.35, scale * 0.9], [0, yaw, 0], 0.96, 0.82, { skinTile: 16, textureBlend: 0.62 });
+    drawFrontFacade(13, 0, -0.563, 0.48, 1.5, 0.45);
+    drawFrontFacade(10, 0, -0.463, 1.02, 0.9, 0.28);
+    drawFrontFacade(13, 0, 0.563, 0.48, 1.5, 0.45);
+    drawFrontFacade(10, 0, 0.463, 1.02, 0.9, 0.28);
     for (const side of [-0.78, 0.78]) {
       const wheel = rotateGroundPoint(x, z, yaw, side * scale, -scale * 0.54);
-      renderer.draw("cylinder", [0.24, 0.27, 0.29], [wheel[0], scale * 0.22, wheel[1]], [scale * 0.34, scale * 0.2, scale * 0.34], [Math.PI / 2, yaw, 0], 1, 0.22, { skinTile: 4, textureBlend: 0.45 });
+      renderer.draw("cylinder", [0.24, 0.27, 0.29], [wheel[0], scale * 0.22, wheel[1]], [scale * 0.34, scale * 0.2, scale * 0.34], [Math.PI / 2, yaw, 0], 1, 0.22, { skinTile: 17, textureBlend: 0.78 });
     }
   } else if (eraIndex === 3) {
-    renderer.draw("cylinder", [0.38, 0.58, 0.9], [x, scale * 1.45, z], [scale * 0.16, scale * 2.9, scale * 0.16], [0, 0, 0], 1, 0.66, { skinTile: 5, textureBlend: 0.95, textureScale: [1, 3] });
+    renderer.draw("cylinder", [0.38, 0.58, 0.9], [x, scale * 1.45, z], [scale * 0.16, scale * 2.9, scale * 0.16], [0, yaw, 0], 1, 0.66, { skinTile: 18, textureBlend: 0.95, textureScale: [1, 3] });
     for (let ring = 0; ring < 3; ring += 1) {
       const pulse = (time * 0.55 + ring * 0.7) % 2.1;
       renderer.draw(
@@ -1774,11 +1916,59 @@ function drawEraLandmark(
         0.4,
       );
     }
-    renderer.draw("cone", [0.74, 0.94, 1], [x, scale * 3.0, z], [scale * 0.45, scale * 0.9, scale * 0.45], [0, yaw, 0], 1, 0.74, { skinTile: 5, textureBlend: 0.7 });
+    renderer.draw("cone", [0.74, 0.94, 1], [x, scale * 3.0, z], [scale * 0.45, scale * 0.9, scale * 0.45], [0, yaw, 0], 1, 0.74, { skinTile: 19, textureBlend: 0.92 });
+    const consoleCenter = localPoint(0, -0.44, 0.55);
+    renderer.draw(
+      "cube",
+      [0.3, 0.42, 0.64],
+      consoleCenter,
+      [scale * 0.84, scale * 0.74, scale * 0.56],
+      [0, yaw, 0],
+      1,
+      0.7,
+      { skinTile: 20, textureBlend: 0.9 },
+    );
+    drawFrontFacade(15, 0, -0.732, 0.55, 0.72, 0.58);
+    const rearConsoleCenter = localPoint(0, 0.44, 0.55);
+    renderer.draw(
+      "cube",
+      [0.3, 0.42, 0.64],
+      rearConsoleCenter,
+      [scale * 0.84, scale * 0.74, scale * 0.56],
+      [0, yaw, 0],
+      1,
+      0.7,
+      { skinTile: 20, textureBlend: 0.9 },
+    );
+    drawFrontFacade(15, 0, 0.732, 0.55, 0.72, 0.58);
   } else {
-    renderer.draw("cylinder", [0.83, 0.72, 0.48], [x, scale * 0.82, z], [scale * 0.35, scale * 1.65, scale * 0.35], [0, yaw, 0], 1, 0.16, { skinTile: 1, textureBlend: 0.82, textureScale: [1, 2] });
-    renderer.draw("sphere", [0.56, 0.92, 0.52], [x, scale * 1.9, z], [scale * 1.55, scale * 1.3, scale * 1.55], [0, yaw, 0], 1, 0.32, { skinTile: 6, textureBlend: 0.72, textureScale: 1.4 });
-    renderer.draw("sphere", [0.64, 0.96, 0.91], [x, scale * 1.7, z], [scale * 1.85, scale * 1.02, scale * 1.85], [0, -yaw, 0], 0.34, 0.9, { skinTile: 7, textureBlend: 0.92, textureScale: 1.2 });
+    renderer.draw("cylinder", [0.83, 0.72, 0.48], [x, scale * 0.82, z], [scale * 0.35, scale * 1.65, scale * 0.35], [0, yaw, 0], 1, 0.16, { skinTile: 21, textureBlend: 0.9, textureScale: [1, 2] });
+    renderer.draw("sphere", [0.56, 0.92, 0.52], [x, scale * 1.9, z], [scale * 1.55, scale * 1.3, scale * 1.55], [0, yaw, 0], 1, 0.32, { skinTile: 6, textureBlend: 0.82, textureScale: 1.4 });
+    renderer.draw("sphere", [0.64, 0.96, 0.91], [x, scale * 1.7, z], [scale * 1.85, scale * 1.02, scale * 1.85], [0, yaw, 0], 0.34, 0.9, { skinTile: 22, textureBlend: 0.94, textureScale: 1.2 });
+    const vestibuleCenter = localPoint(0, -0.62, 0.55);
+    renderer.draw(
+      "cube",
+      [0.66, 0.92, 0.76],
+      vestibuleCenter,
+      [scale * 0.82, scale * 1.02, scale * 0.52],
+      [0, yaw, 0],
+      1,
+      0.8,
+      { skinTile: 22, textureBlend: 0.9 },
+    );
+    drawFrontFacade(20, 0, -0.892, 0.55, 0.72, 0.88);
+    const rearVestibuleCenter = localPoint(0, 0.62, 0.55);
+    renderer.draw(
+      "cube",
+      [0.66, 0.92, 0.76],
+      rearVestibuleCenter,
+      [scale * 0.82, scale * 1.02, scale * 0.52],
+      [0, yaw, 0],
+      1,
+      0.8,
+      { skinTile: 22, textureBlend: 0.9 },
+    );
+    drawFrontFacade(20, 0, 0.892, 0.55, 0.72, 0.88);
   }
 }
 
@@ -1821,15 +2011,24 @@ function drawEraDressingIsland(
     0.42,
   );
   for (let index = 0; index < 4; index += 1) {
-    const angle = phase + index * 1.61;
-    const propX = x + Math.cos(angle) * scale * mix(0.72, 1.46, index / 3);
-    const propZ = z + Math.sin(angle) * scale * mix(0.72, 1.46, index / 3);
+    const localAngle = index * 1.61;
+    const propDistance = scale * mix(0.72, 1.46, index / 3);
+    const propPoint = rotateGroundPoint(
+      x,
+      z,
+      phase,
+      Math.cos(localAngle) * propDistance,
+      Math.sin(localAngle) * propDistance,
+    );
+    const propX = propPoint[0];
+    const propZ = propPoint[1];
+    const propYaw = phase - localAngle;
     const propScale = scale * mix(0.32, 0.52, (index % 3) / 2);
     if (state.era === 0 || state.era === 4) {
       if (index === 0) {
         drawToyTree(renderer, propX, propZ, propScale, time, phase);
       } else {
-        drawContactShadow(renderer, propX, propZ, propScale * 0.7, 0.14, angle);
+        drawContactShadow(renderer, propX, propZ, propScale * 0.7, 0.14, propYaw);
         renderer.draw(
           state.era === 0 ? "cylinder" : "sphere",
           state.era === 0
@@ -1837,7 +2036,7 @@ function drawEraDressingIsland(
             : mixColor(focusColor, [1, 0.84, 0.4], 0.18),
           [propX, propScale * 0.38, propZ],
           [propScale * 0.82, propScale * 0.74, propScale * 0.82],
-          [0, angle, 0],
+          [0, propYaw, 0],
           1,
           0.34,
           {
@@ -1847,13 +2046,13 @@ function drawEraDressingIsland(
         );
       }
     } else {
-      drawContactShadow(renderer, propX, propZ, propScale * 0.7, 0.14, angle);
+      drawContactShadow(renderer, propX, propZ, propScale * 0.7, 0.14, propYaw);
       renderer.draw(
         state.era === 3 ? "cylinder" : index % 2 === 0 ? "cube" : "cone",
         mixColor(focusColor, [1, 0.88, 0.46], 0.2),
         [propX, propScale * 0.56, propZ],
         [propScale * 0.78, propScale * 1.08, propScale * 0.78],
-        [0, angle, 0],
+        [0, propYaw, 0],
         1,
         0.5,
         {
@@ -1873,6 +2072,110 @@ function drawEraDressingIsland(
       );
     }
   }
+}
+
+function drawEraImageGallery(
+  renderer: WebGlToyRenderer,
+  state: GameState,
+  camera: CameraState,
+  x: number,
+  z: number,
+  base: number,
+  yaw: number,
+) {
+  const themeIndex = THEME_INDEX[ERAS[state.era].focus];
+  const themeColor = THEME_BY_ID[ERAS[state.era].focus].color;
+  const objectTiles = [15, 16, 17, 18, 19, 11, 14].map(
+    (kind) => themeIndex * OBJECT_VARIANTS_PER_THEME + kind,
+  );
+  const desktopPlacements = [
+    [-2.35, -1.2, 1.02],
+    [2.35, -1.1, 1.08],
+    [-2.15, 1.2, 0.98],
+    [2.15, 1.25, 1.04],
+    [-0.95, 1.75, 0.9],
+    [0.95, 1.75, 0.94],
+    [0, -1.9, 1.12],
+  ] as const;
+  const mobilePlacements = [
+    [-2.1, -1.15, 0.92],
+    [2.1, -1.1, 0.96],
+    [0, 1.65, 0.9],
+  ] as const;
+  const placements = state.lowQuality ? mobilePlacements : desktopPlacements;
+
+  placements.forEach(([localX, localZ, sizeScale], index) => {
+    const point = rotateGroundPoint(x, z, yaw, localX * base, localZ * base);
+    const toCameraX = camera.eye[0] - point[0];
+    const toCameraZ = camera.eye[2] - point[1];
+    const cameraDistance = Math.hypot(toCameraX, toCameraZ) || 1;
+    const dirX = toCameraX / cameraDistance;
+    const dirZ = toCameraZ / cameraDistance;
+    const displayYaw = Math.atan2(dirX, dirZ);
+    const imageSize = base * (state.lowQuality ? 1.12 : 1.32) * sizeScale;
+    const pedestalRadius = base * (state.lowQuality ? 0.42 : 0.48);
+    const pedestalHeight = base * 0.18;
+    const decalOffset = base * 0.055;
+    const standColor = mixColor(themeColor, [0.11, 0.16, 0.18], 0.48);
+
+    if (!state.lowQuality) {
+      drawContactShadow(renderer, point[0], point[1], pedestalRadius * 1.08, 0.15, displayYaw);
+    }
+    renderer.draw(
+      "sphere",
+      mixColor(standColor, [0.14, 0.28, 0.34], 0.34),
+      [
+        point[0] - dirX * base * 0.065,
+        pedestalHeight + imageSize * 0.51,
+        point[1] - dirZ * base * 0.065,
+      ],
+      [imageSize * 0.76, imageSize * 0.88, base * 0.16],
+      [0, displayYaw, 0],
+      1,
+      0.82,
+      {
+        skinTile: SKIN_BY_THEME[ERAS[state.era].focus],
+        textureBlend: 0.46,
+        textureScale: 1.35,
+      },
+    );
+    renderer.draw(
+      "cylinder",
+      standColor,
+      [point[0], pedestalHeight * 0.5, point[1]],
+      [pedestalRadius * 2, pedestalHeight, pedestalRadius * 2],
+      [0, displayYaw, 0],
+      1,
+      0.5,
+      {
+        skinTile: SKIN_BY_THEME[ERAS[state.era].focus],
+        textureBlend: 0.7,
+      },
+    );
+    renderer.draw(
+      "cube",
+      mixColor(standColor, [1, 0.84, 0.38], 0.18),
+      [
+        point[0] - dirX * base * 0.035,
+        pedestalHeight + imageSize * 0.27,
+        point[1] - dirZ * base * 0.035,
+      ],
+      [base * 0.08, imageSize * 0.58, base * 0.08],
+      [0, displayYaw, 0],
+      1,
+      0.48,
+    );
+    renderer.drawObjectDecal(
+      objectTiles[index],
+      [
+        point[0] + dirX * decalOffset,
+        pedestalHeight + imageSize * 0.52,
+        point[1] + dirZ * decalOffset,
+      ],
+      imageSize,
+      displayYaw,
+    );
+  });
 }
 
 function drawEraEnvironment(
@@ -1908,6 +2211,27 @@ function drawEraEnvironment(
     1,
     0.1,
   );
+  const terrainZones = [
+    [-half * 0.31, -half * 0.04, half * 0.46, half * 0.38, -0.12],
+    [half * 0.3, -half * 0.24, half * 0.48, half * 0.42, 0.18],
+    [0, -half * 0.58, half * 0.68, half * 0.3, 0],
+  ] as const;
+  terrainZones.forEach(([zoneX, zoneZ, zoneWidth, zoneLength, zoneYaw], index) => {
+    renderer.draw(
+      "cube",
+      mixColor(groundLight, focusColor, 0.08 + index * 0.045),
+      [zoneX, base * (0.009 + index * 0.002), zoneZ],
+      [zoneWidth, base * 0.018, zoneLength],
+      [0, zoneYaw, 0],
+      1,
+      0.14,
+      {
+        skinTile: groundSkin,
+        textureBlend: 0.46,
+        textureScale: [6 + index * 1.5, 5 + index],
+      },
+    );
+  });
   const pathSkin = state.era === 0 ? 8 : state.era === 4 ? 7 : groundSkin;
   const pathColor = state.era === 3
     ? mixColor([0.22, 0.34, 0.52], [0.82, 0.94, 1], 0.2)
@@ -1919,6 +2243,23 @@ function drawEraEnvironment(
     const nextX = Math.sin((index + 1) * 0.78 + state.era * 0.44) * base * 1.08;
     const yaw = Math.atan2(nextX - x, -base * 1.78);
     drawPathTile(renderer, x, z, base * 1.52, base * 1.96, yaw, pathSkin, pathColor);
+    for (const railSide of [-1, 1]) {
+      const railPoint = rotateGroundPoint(x, z, yaw, railSide * base * 0.82, 0);
+      renderer.draw(
+        "cube",
+        mixColor(focusColor, [0.12, 0.18, 0.2], 0.58),
+        [railPoint[0], base * 0.07, railPoint[1]],
+        [base * 0.075, base * 0.14, base * 1.55],
+        [0, yaw, 0],
+        1,
+        0.34,
+        {
+          skinTile: SKIN_BY_THEME[era.focus],
+          textureBlend: 0.58,
+          textureScale: [1, 2.2],
+        },
+      );
+    }
     if (index % 2 === 0) {
       const directionX = nextX - x;
       const directionZ = -base * 1.78;
@@ -1958,6 +2299,40 @@ function drawEraEnvironment(
           [0, 0, 0],
           1,
           0.92,
+        );
+        const toCameraX = camera.eye[0] - postX;
+        const toCameraZ = camera.eye[2] - postZ;
+        const cameraDistance = Math.hypot(toCameraX, toCameraZ) || 1;
+        const dirX = toCameraX / cameraDistance;
+        const dirZ = toCameraZ / cameraDistance;
+        const displayYaw = Math.atan2(dirX, dirZ);
+        const displaySize = base * (state.lowQuality ? 0.72 : 0.86);
+        renderer.draw(
+          "cube",
+          mixColor(focusColor, [0.08, 0.13, 0.17], 0.68),
+          [
+            postX - dirX * base * 0.035,
+            Math.min(postHeight * 0.72, base * 1.15),
+            postZ - dirZ * base * 0.035,
+          ],
+          [displaySize * 0.92, displaySize * 0.92, base * 0.085],
+          [0, displayYaw, 0],
+          1,
+          0.72,
+          {
+            skinTile: SKIN_BY_THEME[era.focus],
+            textureBlend: 0.64,
+          },
+        );
+        renderer.drawObjectDecal(
+          decalTileFor(era.focus, 15 + Math.floor(index / 2) % 5),
+          [
+            postX + dirX * base * 0.045,
+            Math.min(postHeight * 0.72, base * 1.15),
+            postZ + dirZ * base * 0.045,
+          ],
+          displaySize,
+          displayYaw,
         );
         if (isBeacon) {
           renderer.draw(
@@ -2001,6 +2376,40 @@ function drawEraEnvironment(
       Math.atan2(nextX - x, nextZ - z),
       pathSkin,
       mixColor(pathColor, focusColor, 0.1),
+    );
+  }
+
+  const heroStations = state.lowQuality
+    ? [[-3.8, -8.4, 0.76, 0.48] as const]
+    : [
+        [-4.2, -8.2, 0.82, 0.48] as const,
+        [4.6, -12.4, 0.98, -0.62] as const,
+      ];
+  for (const [xRatio, zRatio, scaleRatio, stationYaw] of heroStations) {
+    const stationX = base * xRatio;
+    const stationZ = base * zRatio;
+    renderer.draw(
+      "cube",
+      mixColor(groundEdge, focusColor, 0.2),
+      [stationX, base * 0.055, stationZ],
+      [base * scaleRatio * 2.8, base * 0.11, base * scaleRatio * 2.3],
+      [0, stationYaw, 0],
+      1,
+      0.16,
+      {
+        skinTile: groundSkin,
+        textureBlend: 0.68,
+        textureScale: [2.4, 2],
+      },
+    );
+    drawEraLandmark(
+      renderer,
+      state.era,
+      stationX,
+      stationZ,
+      base * scaleRatio,
+      stationYaw,
+      time,
     );
   }
 
@@ -2074,6 +2483,31 @@ function drawEraEnvironment(
   }
 
   const random = seededRandom(4400 + state.era * 811);
+  if (!state.lowQuality) {
+    const detailRandom = seededRandom(8800 + state.era * 977);
+    for (let index = 0; index < 30; index += 1) {
+      const detailX = (detailRandom() - 0.5) * half * 1.32;
+      const detailZ = -base * 2.8 - detailRandom() * half * 0.66;
+      if (Math.hypot(detailX, detailZ) < base * 4.2) continue;
+      const detailSize = base * mix(0.09, 0.22, detailRandom());
+      const detailShape: MeshName =
+        index % 5 === 0 ? "cone" : index % 3 === 0 ? "sphere" : index % 2 === 0 ? "cube" : "cylinder";
+      renderer.draw(
+        detailShape,
+        mixColor(focusColor, groundEdge, 0.42 + (index % 3) * 0.09),
+        [detailX, detailSize * 0.5, detailZ],
+        [detailSize, detailSize * mix(0.65, 1.7, detailRandom()), detailSize],
+        [0, detailRandom() * Math.PI * 2, 0],
+        1,
+        0.32,
+        {
+          skinTile: SKIN_BY_THEME[era.focus],
+          textureBlend: 0.68,
+          textureScale: 1.2,
+        },
+      );
+    }
+  }
   const propCount = state.lowQuality ? 1 : 18;
   for (let index = 0; index < propCount; index += 1) {
     const angle = random() * Math.PI * 2;
@@ -2091,7 +2525,8 @@ function drawEraEnvironment(
     } else if (state.era === 1) {
       if (!state.lowQuality) drawContactShadow(renderer, x, z, scale * 0.82, 0.15, angle);
       renderer.draw("cube", [1, 0.78, 0.33], [x, scale * 0.34, z], [scale * 1.45, scale * 0.62, scale * 0.92], [0, angle, 0], 1, 0.34, { skinTile: index % 2 === 0 ? 3 : 2, textureBlend: 0.82, textureScale: [1.6, 1] });
-      renderer.draw("cone", [1, 0.88, 0.48], [x + Math.cos(angle) * scale * 0.38, scale * 0.82, z + Math.sin(angle) * scale * 0.38], [scale * 0.28, scale * 0.68, scale * 0.28], [0, angle, 0], 1, 0.45, { skinTile: 3, textureBlend: 0.68 });
+      const conePoint = rotateGroundPoint(x, z, angle, scale * 0.38, 0);
+      renderer.draw("cone", [1, 0.88, 0.48], [conePoint[0], scale * 0.82, conePoint[1]], [scale * 0.28, scale * 0.68, scale * 0.28], [0, angle, 0], 1, 0.45, { skinTile: 3, textureBlend: 0.68 });
     } else if (state.era === 2) {
       if (!state.lowQuality) drawContactShadow(renderer, x, z, scale * 0.9, 0.15, angle);
       renderer.draw("cube", [0.72, 0.9, 1], [x, scale * 0.44, z], [scale * 1.7, scale * 0.82, scale], [0, angle, 0], 1, 0.42, { skinTile: 4, textureBlend: 0.88, textureScale: [2, 1] });
@@ -2121,12 +2556,13 @@ function drawEraEnvironment(
 
   const setPieceX = half * 0.31;
   const setPieceZ = -half * 0.42;
+  const setPieceYaw = state.era === 0 ? -0.92 : -0.38;
   renderer.draw(
     "cube",
     mixColor(groundEdge, focusColor, 0.16),
     [setPieceX, base * 0.08, setPieceZ],
     [base * 5.72, base * 0.16, base * 4.66],
-    [0, -0.38, 0],
+    [0, setPieceYaw, 0],
     1,
     0.16,
   );
@@ -2135,9 +2571,14 @@ function drawEraEnvironment(
     mixColor(groundLight, focusColor, 0.24),
     [setPieceX, base * 0.19, setPieceZ],
     [base * 5.42, base * 0.08, base * 4.36],
-    [0, -0.38, 0],
+    [0, setPieceYaw, 0],
     1,
     0.22,
+    {
+      skinTile: groundSkin,
+      textureBlend: 0.7,
+      textureScale: [4.8, 4.1],
+    },
   );
   drawEraLandmark(
     renderer,
@@ -2145,21 +2586,37 @@ function drawEraEnvironment(
     setPieceX,
     setPieceZ,
     base * 1.95,
-    state.era === 0 ? -0.92 : -0.38,
+    setPieceYaw,
     time,
   );
+  drawEraImageGallery(
+    renderer,
+    state,
+    camera,
+    setPieceX,
+    setPieceZ,
+    base,
+    setPieceYaw,
+  );
   for (const side of [-1, 1]) {
-    const crateX = setPieceX + side * base * 1.7;
-    const crateZ = setPieceZ + base * 1.15;
+    const cratePoint = rotateGroundPoint(
+      setPieceX,
+      setPieceZ,
+      setPieceYaw,
+      side * base * 1.7,
+      base * 1.15,
+    );
+    const crateX = cratePoint[0];
+    const crateZ = cratePoint[1];
     if (!state.lowQuality) {
-      drawContactShadow(renderer, crateX, crateZ, base * 0.65, 0.16, side * 0.24);
+      drawContactShadow(renderer, crateX, crateZ, base * 0.65, 0.16, setPieceYaw + side * 0.24);
     }
     renderer.draw(
       state.era === 0 || state.era === 4 ? "cylinder" : "cube",
       mixColor(focusColor, [1, 0.84, 0.42], 0.28),
       [crateX, base * 0.42, crateZ],
       [base * 0.9, base * 0.82, base * 0.9],
-      [0, side * 0.24, 0],
+      [0, setPieceYaw + side * 0.24, 0],
       1,
       0.4,
       {
@@ -2222,7 +2679,7 @@ function drawItem(
   const theme = THEME_BY_ID[item.theme];
   const isFocus = item.theme === focusTheme;
   const variant = item.objectKind % OBJECT_VARIANTS_PER_THEME;
-  const imageFamily = variant % OBJECT_ATLAS_COLUMNS;
+  const imageFamily = variant % OBJECT_GEOMETRY_FAMILY_COUNT;
   const valueScale = 1 + (variant % 5) * 0.035 + (variant >= 5 ? 0.1 : 0);
   const visualScale = (item.special ? 1.08 : isFocus ? 1.3 : 1.1) * valueScale;
   const r = item.r * visualScale;
@@ -2243,6 +2700,33 @@ function drawItem(
     const length = Math.hypot(toCameraX, toCameraZ) || 1;
     const dirX = toCameraX / length;
     const dirZ = toCameraZ / length;
+    if (lowQuality) {
+      const simpleShape: MeshName =
+        imageFamily === 0
+          ? "cylinder"
+          : imageFamily === 1
+            ? "cube"
+            : imageFamily === 2
+              ? "cone"
+              : imageFamily === 3
+                ? "cylinder"
+                : "sphere";
+      renderer.draw(
+        simpleShape,
+        color,
+        [item.x, y + r * 0.1, item.z],
+        [r * 0.82, r * 1.05, r * 0.82],
+        [0, item.yaw, 0],
+        1,
+        0.52,
+        {
+          skinTile: SKIN_BY_THEME[item.theme],
+          textureBlend: 0.72,
+          textureScale: 1.2,
+        },
+      );
+      return;
+    }
     if (isFocus) {
       renderer.draw(
         "cylinder",
@@ -2257,7 +2741,7 @@ function drawItem(
     renderer.drawObjectDecal(
       item.decalTile,
       [item.x + dirX * r * 0.24, y + r * 0.28, item.z + dirZ * r * 0.24],
-      r * (isFocus ? 1.26 : 1.05),
+      r * (lowQuality ? 2.05 : isFocus ? 1.26 : 1.05),
       Math.atan2(dirX, dirZ),
       lowQuality ? 1 : isFocus ? 0.82 : 0.64,
     );
@@ -2310,6 +2794,11 @@ function drawItem(
       Math.atan2(dirX, dirZ),
       lowQuality ? 1 : item.special ? 0.96 : 0.9,
     );
+  };
+
+  const itemPosition = (localX: number, height: number, localZ: number): Vec3 => {
+    const point = rotateGroundPoint(item.x, item.z, item.yaw, localX * r, localZ * r);
+    return [point[0], height, point[1]];
   };
 
   const wheel = (localX: number, localZ: number, size = 0.22) => {
@@ -2383,14 +2872,14 @@ function drawItem(
     renderer.draw(
       "cube",
       [0.96, 0.76, 0.34],
-      [item.x - Math.sin(0.58) * r * 0.68, y + Math.cos(0.58) * r * 0.68, item.z],
+      itemPosition(Math.sin(0.58) * 0.68, y + Math.cos(0.58) * r * 0.68, 0),
       [r * 0.92, r * 0.38, r * 0.48],
       [0, item.yaw, -0.2],
       1,
       0.58,
       { skinTile: 0, textureBlend: 0.42, textureScale: [1.4, 1] },
     );
-    if (variant >= 5) renderer.draw("cylinder", [0.9, 0.26, 0.18], [item.x + r * 0.34, y - r * 0.48, item.z], [r * 0.18, r * 0.5, r * 0.18], [0, item.yaw, 0.32], 1, 0.46);
+    if (variant >= 5) renderer.draw("cylinder", [0.9, 0.26, 0.18], itemPosition(0.34, y - r * 0.48, 0), [r * 0.18, r * 0.5, r * 0.18], [0, item.yaw, 0.32], 1, 0.46);
     drawDecal(0.2, 0.86);
   } else if (item.theme === "manufacturing" && imageFamily === 2) {
     renderer.draw(
@@ -2405,18 +2894,18 @@ function drawItem(
     );
     renderer.draw("cylinder", [1, 0.92, 0.7], [item.x, y + r * 0.5, item.z], [r * 1.12, r * 0.16, r * 1.12], [0, item.yaw, 0], 1, 0.52, { skinTile: 8, textureBlend: 0.32 });
     renderer.draw("cylinder", [0.74, 0.48, 0.3], [item.x, y + r * 0.7, item.z], [r * 0.2, r * 0.52, r * 0.2], [0, item.yaw, 0], 1, 0.28, { skinTile: 1, textureBlend: 0.46 });
-    if (variant >= 5) renderer.draw("cube", [0.98, 0.42, 0.22], [item.x, y + r * 0.42, item.z + r * 0.42], [r * 0.26, r * 0.86, r * 0.24], [0, item.yaw, 0.5], 1, 0.52);
+    if (variant >= 5) renderer.draw("cube", [0.98, 0.42, 0.22], itemPosition(0, y + r * 0.42, 0.42), [r * 0.26, r * 0.86, r * 0.24], [0, item.yaw, 0.5], 1, 0.52);
     drawDecal(0.12, 0.9);
   } else if (item.theme === "manufacturing" && imageFamily === 3) {
     renderer.draw("cylinder", [0.92, 0.34, 0.22], [item.x, y + r * 0.08, item.z], [r * 0.56, r * 1.05, r * 0.56], [Math.PI / 2, item.yaw, 0], 1, 0.62, { skinTile: 0, textureBlend: 0.58 });
-    renderer.draw("sphere", [0.74, 0.44, 0.22], [item.x, y - r * 0.12, item.z + r * 0.56], [r * 0.6, r * 0.42, r * 0.6], [0, item.yaw, 0], 1, 0.24, { skinTile: 1, textureBlend: 0.55 });
-    renderer.draw("cylinder", [0.92, 0.76, 0.5], [item.x, y + r * 0.56, item.z - r * 0.4], [r * 0.12, r * 0.74, r * 0.12], [0, 0, 0], 1, 0.44);
-    if (variant >= 5) renderer.draw("sphere", [0.98, 0.82, 0.3], [item.x, y + r * 0.96, item.z - r * 0.4], [r * 0.16, r * 0.16, r * 0.16], [0, 0, 0], 1, 0.92);
+    renderer.draw("sphere", [0.74, 0.44, 0.22], itemPosition(0, y - r * 0.12, 0.56), [r * 0.6, r * 0.42, r * 0.6], [0, item.yaw, 0], 1, 0.24, { skinTile: 1, textureBlend: 0.55 });
+    renderer.draw("cylinder", [0.92, 0.76, 0.5], itemPosition(0, y + r * 0.56, -0.4), [r * 0.12, r * 0.74, r * 0.12], [0, item.yaw, 0], 1, 0.44);
+    if (variant >= 5) renderer.draw("sphere", [0.98, 0.82, 0.3], itemPosition(0, y + r * 0.96, -0.4), [r * 0.16, r * 0.16, r * 0.16], [0, item.yaw, 0], 1, 0.92);
     drawDecal(0.18, 0.86);
   } else if (item.theme === "manufacturing") {
     renderer.draw("cube", [0.92, 0.24, 0.18], [item.x, y, item.z], [r * 1.34, r * 0.46, r * 0.56], [0, item.yaw, 0], 1, 0.62, { skinTile: 0, textureBlend: 0.5 });
-    renderer.draw("cylinder", [0.22, 0.22, 0.23], [item.x - r * 0.48, y - r * 0.04, item.z], [r * 0.14, r * 0.78, r * 0.14], [0, 0, Math.PI / 2], 1, 0.26);
-    renderer.draw("cylinder", [0.22, 0.22, 0.23], [item.x + r * 0.48, y - r * 0.04, item.z], [r * 0.14, r * 0.78, r * 0.14], [0, 0, Math.PI / 2], 1, 0.26);
+    renderer.draw("cylinder", [0.22, 0.22, 0.23], itemPosition(-0.48, y - r * 0.04, 0), [r * 0.14, r * 0.78, r * 0.14], [0, item.yaw, Math.PI / 2], 1, 0.26);
+    renderer.draw("cylinder", [0.22, 0.22, 0.23], itemPosition(0.48, y - r * 0.04, 0), [r * 0.14, r * 0.78, r * 0.14], [0, item.yaw, Math.PI / 2], 1, 0.26);
     if (variant >= 5) renderer.draw("sphere", [0.96, 0.78, 0.42], [item.x, y + r * 0.42, item.z], [r * 0.22, r * 0.22, r * 0.22], [0, 0, 0], 1, 0.86);
     drawDecal(0.24, 0.82);
   } else if (item.theme === "construction" && imageFamily === 0) {
@@ -2432,7 +2921,7 @@ function drawItem(
     renderer.draw("sphere", [1, 0.84, 0.3], [item.x, y + r * 0.12, item.z], [r * 1.18, r * 0.78, r * 1.18], [0, item.yaw, 0], 1, 0.48, { skinTile: 3, textureBlend: 0.52, textureScale: 1.3 });
     renderer.draw("cylinder", [1, 0.9, 0.52], [item.x, y - r * 0.12, item.z], [r * 1.48, r * 0.14, r * 1.48], [0, item.yaw, 0], 1, 0.52, { skinTile: 3, textureBlend: 0.42 });
     renderer.draw("cube", [0.88, 0.58, 0.24], [item.x, y + r * 0.66, item.z], [r * 0.18, r * 0.34, r * 0.66], [0, item.yaw, 0], 1, 0.36, { skinTile: 2, textureBlend: 0.42 });
-    if (variant >= 5) renderer.draw("cube", [1, 0.95, 0.55], [item.x - r * 0.34, y + r * 0.18, item.z], [r * 0.22, r * 0.42, r * 0.22], [0, item.yaw, 0], 1, 0.5);
+    if (variant >= 5) renderer.draw("cube", [1, 0.95, 0.55], itemPosition(-0.34, y + r * 0.18, 0), [r * 0.22, r * 0.42, r * 0.22], [0, item.yaw, 0], 1, 0.5);
     drawDecal(0.16, 0.9);
   } else if (item.theme === "construction" && imageFamily === 2) {
     for (const side of [-0.42, 0.42]) {
@@ -2449,7 +2938,7 @@ function drawItem(
     renderer.draw("cube", [0.94, 0.7, 0.24], [item.x, y, item.z], [r * 0.74, r * 0.74, r * 0.74], [0, item.yaw, 0], 1, 0.45, { skinTile: 3, textureBlend: 0.62 });
     renderer.draw("cylinder", [0.18, 0.18, 0.19], [item.x, y - r * 0.58, item.z], [r * 0.18, r * 0.72, r * 0.18], [0, 0, 0], 1, 0.28);
     renderer.draw("cone", [0.12, 0.12, 0.12], [item.x, y - r * 1.02, item.z], [r * 0.46, r * 0.42, r * 0.46], [0, item.yaw, 0], 1, 0.25);
-    if (variant >= 5) renderer.draw("sphere", [1, 0.78, 0.25], [item.x + r * 0.36, y + r * 0.28, item.z], [r * 0.14, r * 0.14, r * 0.14], [0, 0, 0], 1, 0.9);
+    if (variant >= 5) renderer.draw("sphere", [1, 0.78, 0.25], itemPosition(0.36, y + r * 0.28, 0), [r * 0.14, r * 0.14, r * 0.14], [0, item.yaw, 0], 1, 0.9);
     drawDecal(0.18, 0.86);
   } else if (item.theme === "construction") {
     renderer.draw("cylinder", [0.96, 0.76, 0.28], [item.x, y, item.z], [r * 0.64, r * 1.08, r * 0.64], [Math.PI / 2, item.yaw, 0], 1, 0.38, { skinTile: 3, textureBlend: 0.48 });
@@ -2465,13 +2954,13 @@ function drawItem(
         renderer.draw("cylinder", [0.18, 0.2, 0.22], [wheel[0], r * 0.24, wheel[1]], [r * 0.29, r * 0.2, r * 0.29], [Math.PI / 2, item.yaw, 0], 1, 0.24, { skinTile: 4, textureBlend: 0.42 });
       }
     }
-    if (variant >= 5) renderer.draw("cube", [0.94, 0.98, 1], [item.x, y + r * 0.76, item.z - r * 0.12], [r * 0.38, r * 0.18, r * 0.5], [0, item.yaw, 0], 1, 0.7);
+    if (variant >= 5) renderer.draw("cube", [0.94, 0.98, 1], itemPosition(0, y + r * 0.76, -0.12), [r * 0.38, r * 0.18, r * 0.5], [0, item.yaw, 0], 1, 0.7);
     drawDecal(0.26, 0.9);
   } else if (item.theme === "transport" && imageFamily === 1) {
     renderer.draw("cylinder", [0.16, 0.22, 0.28], [item.x, y, item.z], [r * 1.08, r * 0.34, r * 1.08], [Math.PI / 2, item.yaw, 0], 1, 0.28, { skinTile: 4, textureBlend: 0.48, textureScale: 1.3 });
-    renderer.draw("cylinder", [0.46, 0.84, 1], [item.x, y, item.z - r * 0.22], [r * 0.54, r * 0.4, r * 0.54], [Math.PI / 2, item.yaw, 0], 1, 0.62, { skinTile: 4, textureBlend: 0.52 });
-    renderer.draw("sphere", [1, 0.78, 0.28], [item.x, y, item.z - r * 0.46], [r * 0.18, r * 0.18, r * 0.12], [0, 0, 0], 1, 0.86);
-    if (variant >= 5) renderer.draw("cube", [0.54, 0.94, 1], [item.x, y + r * 0.1, item.z + r * 0.34], [r * 0.26, r * 0.62, r * 0.16], [0, item.yaw, 0], 1, 0.7);
+    renderer.draw("cylinder", [0.46, 0.84, 1], itemPosition(0, y, -0.22), [r * 0.54, r * 0.4, r * 0.54], [Math.PI / 2, item.yaw, 0], 1, 0.62, { skinTile: 4, textureBlend: 0.52 });
+    renderer.draw("sphere", [1, 0.78, 0.28], itemPosition(0, y, -0.46), [r * 0.18, r * 0.18, r * 0.12], [0, item.yaw, 0], 1, 0.86);
+    if (variant >= 5) renderer.draw("cube", [0.54, 0.94, 1], itemPosition(0, y + r * 0.1, 0.34), [r * 0.26, r * 0.62, r * 0.16], [0, item.yaw, 0], 1, 0.7);
     drawDecal(0.12, 0.88);
   } else if (item.theme === "transport" && imageFamily === 2) {
     renderer.draw("cube", [0.42, 0.78, 0.98], [item.x, y - r * 0.02, item.z], [r * 1.72, r * 0.7, r * 0.9], [0, item.yaw, 0], 1, 0.48, { skinTile: 4, textureBlend: 0.58, textureScale: [1.8, 1] });
@@ -2482,10 +2971,10 @@ function drawItem(
     drawDecal(0.28, 0.9);
   } else if (item.theme === "transport" && imageFamily === 3) {
     renderer.draw("cube", [0.9, 0.96, 1], [item.x, y, item.z], [r * 1.52, r * 0.42, r * 1.18], [0, item.yaw, 0], 1, 0.72, { skinTile: 7, textureBlend: 0.42 });
-    renderer.draw("cube", [0.26, 0.72, 0.96], [item.x - r * 0.78, y - r * 0.02, item.z], [r * 0.58, r * 0.08, r * 0.18], [0, item.yaw, 0], 1, 0.62);
-    renderer.draw("cube", [0.26, 0.72, 0.96], [item.x + r * 0.78, y - r * 0.02, item.z], [r * 0.58, r * 0.08, r * 0.18], [0, item.yaw, 0], 1, 0.62);
-    renderer.draw("cone", [0.22, 0.62, 0.9], [item.x, y + r * 0.56, item.z + r * 0.45], [r * 0.22, r * 0.46, r * 0.22], [0, item.yaw, 0], 1, 0.65);
-    if (variant >= 5) renderer.draw("sphere", [1, 0.8, 0.25], [item.x, y - r * 0.18, item.z - r * 0.68], [r * 0.16, r * 0.16, r * 0.16], [0, 0, 0], 1, 0.9);
+    renderer.draw("cube", [0.26, 0.72, 0.96], itemPosition(-0.78, y - r * 0.02, 0), [r * 0.58, r * 0.08, r * 0.18], [0, item.yaw, 0], 1, 0.62);
+    renderer.draw("cube", [0.26, 0.72, 0.96], itemPosition(0.78, y - r * 0.02, 0), [r * 0.58, r * 0.08, r * 0.18], [0, item.yaw, 0], 1, 0.62);
+    renderer.draw("cone", [0.22, 0.62, 0.9], itemPosition(0, y + r * 0.56, 0.45), [r * 0.22, r * 0.46, r * 0.22], [0, item.yaw, 0], 1, 0.65);
+    if (variant >= 5) renderer.draw("sphere", [1, 0.8, 0.25], itemPosition(0, y - r * 0.18, -0.68), [r * 0.16, r * 0.16, r * 0.16], [0, item.yaw, 0], 1, 0.9);
     drawDecal(0.18, 0.9);
   } else if (item.theme === "transport") {
     renderer.draw("sphere", [0.16, 0.62, 0.9], [item.x, y, item.z], [r * 0.85, r * 0.48, r * 0.85], [0, item.yaw, 0], 1, 0.7, { skinTile: 4, textureBlend: 0.6 });
@@ -2516,11 +3005,11 @@ function drawItem(
     drawDecal(0.16, 0.84);
   } else if (item.theme === "communication" && imageFamily === 1) {
     renderer.draw("cube", [0.42, 0.62, 0.94], [item.x, y, item.z], [r * 1.02, r * 1.34, r * 0.62], [0, item.yaw, 0], 1, 0.7, { skinTile: 5, textureBlend: 0.62, textureScale: [1.2, 1.6] });
-    renderer.draw("cube", [0.54, 0.94, 1], [item.x, y + r * 0.08, item.z - r * 0.34], [r * 0.7, r * 0.62, r * 0.08], [0, item.yaw, 0], 0.92, 0.95, { skinTile: 7, textureBlend: 0.4 });
+    renderer.draw("cube", [0.54, 0.94, 1], itemPosition(0, y + r * 0.08, -0.34), [r * 0.7, r * 0.62, r * 0.08], [0, item.yaw, 0], 0.92, 0.95, { skinTile: 7, textureBlend: 0.4 });
     for (const row of [-0.26, 0.18, 0.56]) {
-      renderer.draw("sphere", [1, 0.82, 0.28], [item.x - r * 0.32, y + r * row, item.z - r * 0.4], [r * 0.07, r * 0.07, r * 0.05], [0, 0, 0], 1, 0.92);
+      renderer.draw("sphere", [1, 0.82, 0.28], itemPosition(-0.32, y + r * row, -0.4), [r * 0.07, r * 0.07, r * 0.05], [0, item.yaw, 0], 1, 0.92);
     }
-    if (variant >= 5) renderer.draw("cube", [0.22, 0.26, 0.38], [item.x + r * 0.38, y + r * 0.44, item.z], [r * 0.16, r * 0.24, r * 0.16], [0, item.yaw, 0], 1, 0.8);
+    if (variant >= 5) renderer.draw("cube", [0.22, 0.26, 0.38], itemPosition(0.38, y + r * 0.44, 0), [r * 0.16, r * 0.24, r * 0.16], [0, item.yaw, 0], 1, 0.8);
     drawDecal(0.18, 0.86);
   } else if (item.theme === "communication" && imageFamily === 2) {
     renderer.draw("cylinder", [0.46, 0.64, 0.94], [item.x, y - r * 0.38, item.z], [r * 0.18, r * 0.82, r * 0.18], [0, item.yaw, 0], 1, 0.64, { skinTile: 5, textureBlend: 0.52 });
@@ -2531,19 +3020,19 @@ function drawItem(
   } else if (item.theme === "communication" && imageFamily === 3) {
     renderer.draw("cube", [0.48, 0.28, 0.82], [item.x, y, item.z], [r * 0.78, r * 1.16, r * 0.68], [0, item.yaw, 0], 1, 0.86, { skinTile: 5, textureBlend: 0.5 });
     renderer.draw("cylinder", [0.68, 0.56, 0.9], [item.x, y + r * 0.62, item.z], [r * 0.52, r * 0.16, r * 0.52], [Math.PI / 2, item.yaw, 0], 1, 0.8);
-    if (variant >= 5) renderer.draw("sphere", [0.36, 0.98, 0.36], [item.x + r * 0.34, y + r * 0.06, item.z - r * 0.38], [r * 0.08, r * 0.08, r * 0.08], [0, 0, 0], 1, 0.94);
+    if (variant >= 5) renderer.draw("sphere", [0.36, 0.98, 0.36], itemPosition(0.34, y + r * 0.06, -0.38), [r * 0.08, r * 0.08, r * 0.08], [0, item.yaw, 0], 1, 0.94);
     drawDecal(0.14, 0.86);
   } else if (item.theme === "communication") {
     renderer.draw("cube", [0.34, 0.28, 0.58], [item.x, y, item.z], [r * 0.88, r * 1.18, r * 0.86], [0, item.yaw, 0], 1, 0.72, { skinTile: 5, textureBlend: 0.58 });
     renderer.draw("cube", [0.16, 0.16, 0.2], [item.x, y - r * 0.44, item.z], [r * 1.05, r * 0.16, r * 0.95], [0, item.yaw, 0], 1, 0.3);
-    if (variant >= 5) renderer.draw("sphere", [0.96, 0.84, 0.25], [item.x - r * 0.24, y + r * 0.38, item.z - r * 0.48], [r * 0.09, r * 0.09, r * 0.09], [0, 0, 0], 1, 0.9);
+    if (variant >= 5) renderer.draw("sphere", [0.96, 0.84, 0.25], itemPosition(-0.24, y + r * 0.38, -0.48), [r * 0.09, r * 0.09, r * 0.09], [0, item.yaw, 0], 1, 0.9);
     drawDecal(0.18, 0.9);
   } else if (imageFamily === 0) {
     renderer.draw("cylinder", [0.82, 0.7, 0.46], [item.x, y - r * 0.24, item.z], [r * 0.32, r * 0.92, r * 0.32], [0, 0, 0], 1, 0.16, { skinTile: 1, textureBlend: 0.56, textureScale: [1, 1.7] });
     renderer.draw("sphere", [0.6, 0.94, 0.48], [item.x, y + r * 0.34, item.z], [r * 1.16, r * 1.02, r * 1.16], [0, item.yaw, 0], 1, 0.36, { skinTile: 6, textureBlend: 0.64, textureScale: 1.2 });
-    renderer.draw("sphere", mixColor(color, [1, 0.96, 0.58], 0.28), [item.x - r * 0.42, y + r * 0.61, item.z - r * 0.08], [r * 0.52, r * 0.55, r * 0.52], [0, 0, 0], 1, 0.4, { skinTile: 6, textureBlend: 0.5 });
+    renderer.draw("sphere", mixColor(color, [1, 0.96, 0.58], 0.28), itemPosition(-0.42, y + r * 0.61, -0.08), [r * 0.52, r * 0.55, r * 0.52], [0, item.yaw, 0], 1, 0.4, { skinTile: 6, textureBlend: 0.5 });
     if (!lowQuality) {
-      renderer.draw("sphere", mixColor(color, [0.08, 0.42, 0.25], 0.22), [item.x + r * 0.42, y + r * 0.58, item.z + r * 0.12], [r * 0.56, r * 0.6, r * 0.56], [0, 0, 0], 1, 0.34, { skinTile: 6, textureBlend: 0.56 });
+      renderer.draw("sphere", mixColor(color, [0.08, 0.42, 0.25], 0.22), itemPosition(0.42, y + r * 0.58, 0.12), [r * 0.56, r * 0.6, r * 0.56], [0, item.yaw, 0], 1, 0.34, { skinTile: 6, textureBlend: 0.56 });
     }
     if (variant >= 5) renderer.draw("sphere", [1, 0.84, 0.28], [item.x, y + r * 0.98, item.z], [r * 0.16, r * 0.16, r * 0.16], [0, 0, 0], 1, 0.9);
     drawDecal(0.24, 0.88);
@@ -2572,7 +3061,7 @@ function drawItem(
     renderer.draw("cone", [0.48, 0.82, 0.48], [item.x, y - r * 0.12, item.z], [r * 0.9, r * 1.42, r * 0.9], [0, item.yaw, 0], 1, 0.34, { skinTile: 6, textureBlend: 0.58, textureScale: [1, 1.6] });
     renderer.draw("sphere", [0.72, 0.95, 0.5], [item.x, y + r * 0.52, item.z], [r * 0.52, r * 0.64, r * 0.52], [0, item.yaw, 0], 1, 0.42, { skinTile: 6, textureBlend: 0.44 });
     renderer.draw("sphere", [1, 0.84, 0.3], [item.x, y + r * 0.94, item.z], [r * 0.18, r * 0.18, r * 0.18], [0, 0, 0], 1, 0.9);
-    if (variant >= 5) renderer.draw("sphere", [0.24, 0.78, 0.48], [item.x - r * 0.36, y + r * 0.3, item.z], [r * 0.32, r * 0.16, r * 0.32], [0, item.yaw, 0], 1, 0.34);
+    if (variant >= 5) renderer.draw("sphere", [0.24, 0.78, 0.48], itemPosition(-0.36, y + r * 0.3, 0), [r * 0.32, r * 0.16, r * 0.32], [0, item.yaw, 0], 1, 0.34);
     drawDecal(0.18, 0.84);
   }
 }
@@ -2585,7 +3074,7 @@ function drawRobot(
 ) {
   const radius = state.radius;
   const base = ERAS[state.era].baseRadius;
-  const robotScale = base * 0.26;
+  const robotScale = base * 0.3;
   const r = robotScale;
   const speed01 = clamp(Math.hypot(state.vx, state.vz) / Math.max(base * 7.2, 0.01), 0, 1);
   const forwardX = Math.sin(heading);
@@ -2597,6 +3086,7 @@ function drawRobot(
   const centerX = state.x - forwardX * (radius + robotScale * 1.45) + rightX * robotScale * sideOffset;
   const centerZ = state.z - forwardZ * (radius + robotScale * 1.45) + rightZ * robotScale * sideOffset;
   const lean = speed01 * 0.14;
+  const meshYaw = robotMeshYaw(heading);
   const stride = Math.sin(time * mix(5.2, 9.4, speed01)) * r * mix(0.05, 0.14, speed01);
   const local = (x: number, y: number, z: number): Vec3 => [
     centerX + rightX * x + forwardX * z,
@@ -2609,49 +3099,47 @@ function drawRobot(
     state.z - forwardZ * radius * 0.92 + rightZ * x,
   ];
   const drawLimb = (from: Vec3, to: Vec3, thickness: number, color: Vec3, gloss = 0.45) => {
-    const dx = to[0] - from[0];
-    const dz = to[2] - from[2];
-    const length = Math.hypot(dx, dz);
+    const transform = segmentTransform(from, to, thickness);
     renderer.draw(
       "cube",
       color,
-      [(from[0] + to[0]) * 0.5, (from[1] + to[1]) * 0.5, (from[2] + to[2]) * 0.5],
-      [thickness, Math.max(thickness * 0.92, Math.abs(to[1] - from[1]) + thickness), length || thickness],
-      [0, Math.atan2(dx, dz), 0],
+      transform.position,
+      transform.scale,
+      transform.rotation,
       1,
       gloss,
-      { skinTile: 3, textureBlend: 0.18 },
+      { skinTile: 3, textureBlend: 0.58, textureScale: [1, 1.8] },
     );
   };
 
   drawContactShadow(renderer, centerX, centerZ, r * 0.82, 0.24, heading);
-  renderer.draw("sphere", [1, 0.8, 0.26], local(0, r * 0.78, 0), [r * 0.9, r * 1.02, r * 0.76], [lean, heading, 0], 1, 0.62, { skinTile: 3, textureBlend: 0.24 });
-  renderer.draw("cube", [0.18, 0.72, 0.86], local(0, r * 0.8, r * 0.46), [r * 0.58, r * 0.28, r * 0.12], [lean, heading, 0], 1, 0.9, { skinTile: 5, textureBlend: 0.28 });
-  renderer.draw("sphere", [1, 0.98, 0.9], local(0, r * 1.52, r * 0.05), [r * 0.78, r * 0.68, r * 0.72], [lean * 0.6, heading, 0], 1, 0.86, { skinTile: 8, textureBlend: 0.26 });
-  renderer.draw("cube", [0.12, 0.66, 0.86], local(0, r * 1.48, r * 0.43), [r * 0.58, r * 0.26, r * 0.1], [0, heading, 0], 0.98, 0.98, { skinTile: 7, textureBlend: 0.22 });
-  renderer.draw("sphere", [0.05, 0.14, 0.2], local(-r * 0.18, r * 1.49, r * 0.51), [r * 0.08, r * 0.1, r * 0.07], [0, heading, 0], 1, 0.94);
-  renderer.draw("sphere", [0.05, 0.14, 0.2], local(r * 0.18, r * 1.49, r * 0.51), [r * 0.08, r * 0.1, r * 0.07], [0, heading, 0], 1, 0.94);
+  renderer.draw("sphere", [1, 0.8, 0.26], local(0, r * 0.78, 0), [r * 0.9, r * 1.02, r * 0.76], [lean, meshYaw, 0], 1, 0.62, { skinTile: 3, textureBlend: 0.58 });
+  renderer.draw("cube", [0.18, 0.72, 0.86], local(0, r * 0.8, r * 0.39), [r * 0.54, r * 0.25, r * 0.08], [lean, meshYaw, 0], 1, 0.9, { skinTile: 5, textureBlend: 0.7 });
+  renderer.draw("sphere", [1, 0.98, 0.9], local(0, r * 1.52, r * 0.05), [r * 0.78, r * 0.68, r * 0.72], [lean * 0.6, meshYaw, 0], 1, 0.86, { skinTile: 8, textureBlend: 0.48 });
+  renderer.draw("cube", [0.12, 0.66, 0.86], local(0, r * 1.48, r * 0.39), [r * 0.54, r * 0.22, r * 0.07], [0, meshYaw, 0], 0.98, 0.98, { skinTile: 7, textureBlend: 0.58 });
+  renderer.draw("sphere", [0.05, 0.14, 0.2], local(-r * 0.18, r * 1.49, r * 0.45), [r * 0.08, r * 0.1, r * 0.07], [0, meshYaw, 0], 1, 0.94);
+  renderer.draw("sphere", [0.05, 0.14, 0.2], local(r * 0.18, r * 1.49, r * 0.45), [r * 0.08, r * 0.1, r * 0.07], [0, meshYaw, 0], 1, 0.94);
   renderer.draw("cylinder", [0.18, 0.68, 0.82], local(0, r * 1.92, r * 0.02), [r * 0.06, r * 0.42, r * 0.06], [0, 0, 0], 1, 0.7, { skinTile: 5, textureBlend: 0.6 });
   renderer.draw("sphere", [1, 0.76, 0.18], local(0, r * 2.14, r * 0.02), [r * 0.17, r * 0.17, r * 0.17], [0, 0, 0], 1, 0.92);
 
   const leftFoot = local(-r * 0.25, r * 0.23, -r * 0.1 + stride);
   const rightFoot = local(r * 0.25, r * 0.23, -r * 0.1 - stride);
-  renderer.draw("cylinder", [0.28, 0.7, 0.92], leftFoot, [r * 0.17, r * 0.54, r * 0.17], [0, heading, 0.08], 1, 0.48, { skinTile: 4, textureBlend: 0.28 });
-  renderer.draw("cylinder", [0.28, 0.7, 0.92], rightFoot, [r * 0.17, r * 0.54, r * 0.17], [0, heading, -0.08], 1, 0.48, { skinTile: 4, textureBlend: 0.28 });
+  renderer.draw("cylinder", [0.28, 0.7, 0.92], leftFoot, [r * 0.17, r * 0.54, r * 0.17], [0, meshYaw, 0.08], 1, 0.48, { skinTile: 4, textureBlend: 0.5 });
+  renderer.draw("cylinder", [0.28, 0.7, 0.92], rightFoot, [r * 0.17, r * 0.54, r * 0.17], [0, meshYaw, -0.08], 1, 0.48, { skinTile: 4, textureBlend: 0.5 });
 
   const leftShoulder = local(-r * 0.48, r * 1.02, r * 0.28);
   const rightShoulder = local(r * 0.48, r * 1.02, r * 0.28);
   const leftHand = ballContact(-r * 0.42, radius * 0.9);
   const rightHand = ballContact(r * 0.42, radius * 0.9);
-  drawLimb(leftShoulder, leftHand, r * 0.15, [1, 0.76, 0.28]);
-  drawLimb(rightShoulder, rightHand, r * 0.15, [1, 0.76, 0.28]);
+  drawLimb(leftShoulder, leftHand, r * 0.13, [1, 0.76, 0.28]);
+  drawLimb(rightShoulder, rightHand, r * 0.13, [1, 0.76, 0.28]);
   const handleCenter = ballContact(0, radius * 0.9);
   renderer.draw(
     "cube",
     [0.12, 0.66, 0.82],
     handleCenter,
     [r * 0.96, r * 0.12, r * 0.14],
-    [0, heading, 0],
+    [0, meshYaw, 0],
     1,
     0.86,
     { skinTile: 5, textureBlend: 0.34 },
@@ -2661,7 +3149,7 @@ function drawRobot(
     [1, 0.82, 0.24],
     handleCenter,
     [r * 0.22, r * 0.22, r * 0.16],
-    [0, heading, 0],
+    [0, meshYaw, 0],
     1,
     0.94,
   );
@@ -2896,20 +3384,16 @@ function drawWorld(
     );
   }
   for (const particle of state.particles) {
-    const toCameraX = renderCamera.eye[0] - particle.x;
-    const toCameraZ = renderCamera.eye[2] - particle.z;
-    const length = Math.hypot(toCameraX, toCameraZ) || 1;
-    const dirX = toCameraX / length;
-    const dirZ = toCameraZ / length;
-    const size = base * (0.32 + clamp(particle.life, 0, 1) * 0.12);
+    const life = clamp(particle.life, 0, 1);
+    const size = base * (0.055 + life * 0.075);
     renderer.draw(
-      "plane",
+      "sphere",
       particle.color,
       [particle.x, particle.y, particle.z],
       [size, size, size],
-      [0, Math.atan2(dirX, dirZ), 0],
-      state.lowQuality ? 1 : clamp(particle.life * 2, 0, 1),
-      0.82,
+      [0, 0, 0],
+      clamp(life * 1.45, 0, state.lowQuality ? 0.7 : 0.9),
+      0.94,
     );
   }
   drawSpeedEffects(renderer, state, camera, visualTime);
@@ -3295,23 +3779,36 @@ export default function TimeRollGame() {
         if (canCollectByRule(state, item, state.bossReady)) {
           collect(item);
           if (state.mode !== "playing") break;
-        } else if (state.bumpCooldown <= 0) {
-          const normalX = dx / Math.max(distance, 0.001);
-          const normalZ = dz / Math.max(distance, 0.001);
+        } else {
+          const velocityLength = Math.hypot(state.vx, state.vz);
+          const normalX =
+            distance > 0.001
+              ? dx / distance
+              : velocityLength > 0.001
+                ? state.vx / velocityLength
+                : Math.sin(camera.heading);
+          const normalZ =
+            distance > 0.001
+              ? dz / distance
+              : velocityLength > 0.001
+                ? state.vz / velocityLength
+                : -Math.cos(camera.heading);
           const overlap = collisionDistance - distance;
-          state.x -= normalX * overlap * 0.52;
-          state.z -= normalZ * overlap * 0.52;
+          state.x -= normalX * (overlap + state.radius * 0.04);
+          state.z -= normalZ * (overlap + state.radius * 0.04);
           state.vx *= -0.16;
           state.vz *= -0.16;
-          const neededRadius = requiredPlayerRadius(item);
-          state.blockedCollision = item.name;
-          state.message = item.special && !state.bossReady
-            ? `${Math.max(0, ERAS[state.era].goal - state.eraCollected)}개 더 모으면 거대 목표를 열 수 있어요`
-            : `${item.name}은 아직 커요. ${formatSize(neededRadius, state.era)}까지 키워요!`;
-          state.messageTime = 2.2;
-          state.bumpCooldown = 0.75;
-          state.shake = state.reducedMotion ? 0 : 0.25;
-          playTone(190, 0.08, -50);
+          if (state.bumpCooldown <= 0) {
+            const neededRadius = requiredPlayerRadius(item);
+            state.blockedCollision = item.name;
+            state.message = item.special && !state.bossReady
+              ? `${Math.max(0, ERAS[state.era].goal - state.eraCollected)}개 더 모으면 거대 목표를 열 수 있어요`
+              : `${item.name}은 아직 커요. ${formatSize(neededRadius, state.era)}까지 키워요!`;
+            state.messageTime = 2.2;
+            state.bumpCooldown = 0.75;
+            state.shake = state.reducedMotion ? 0 : 0.25;
+            playTone(190, 0.08, -50);
+          }
         }
       }
 
@@ -3544,6 +4041,44 @@ export default function TimeRollGame() {
         completeEra: completeEraForTest,
         nextEra: () => actionsRef.current?.nextEra(),
         retry: () => actionsRef.current?.retryEra(),
+        setCameraHeading: (headingRadians: number) => {
+          camera.heading = wrapAngle(Number(headingRadians) || 0);
+          camera.bank = 0;
+          camera.speed01 = 0;
+          camera.previousVx = 0;
+          camera.previousVz = 0;
+          state.vx = 0;
+          state.vz = 0;
+          updateCamera(camera, state, 1);
+          drawWorld(renderer, state, camera, performance.now() / 1000);
+          syncHud(true);
+        },
+        setCameraPose: (eye: Vec3, target: Vec3, fovDegrees = 52.2) => {
+          camera.eye = eye.map((value) => Number(value) || 0) as Vec3;
+          camera.target = target.map((value) => Number(value) || 0) as Vec3;
+          camera.up = [0, 1, 0];
+          camera.heading = 0;
+          camera.bank = 0;
+          camera.speed01 = 0;
+          camera.previousVx = 0;
+          camera.previousVz = 0;
+          camera.fov = clamp(Number(fovDegrees) || 52.2, 38, 72) * Math.PI / 180;
+          state.vx = 0;
+          state.vz = 0;
+          drawWorld(renderer, state, camera, performance.now() / 1000);
+          syncHud(true);
+        },
+        setPlayerPosition: (x: number, z: number) => {
+          state.x = Number.isFinite(Number(x)) ? Number(x) : state.x;
+          state.z = Number.isFinite(Number(z)) ? Number(z) : state.z;
+          state.vx = 0;
+          state.vz = 0;
+          camera.bank = 0;
+          camera.speed01 = 0;
+          updateCamera(camera, state, 1);
+          drawWorld(renderer, state, camera, performance.now() / 1000);
+          syncHud(true);
+        },
         getState: getTextState,
       };
     }
