@@ -9,7 +9,10 @@
   --sky: #72c6ed;
   --panel: rgb(255 253 244 / 92%);
   --line: rgb(20 36 42 / 16%);
-  --shadow: 0 18px 55px rgb(17 45 55 / 18%);
+  --hud-glass: rgb(255 253 244 / 78%);
+  --hud-trim: rgb(255 255 255 / 72%);
+  --shadow: 0 24px 70px rgb(17 45 55 / 24%);
+  --soft-depth: 0 14px 34px rgb(8 30 38 / 15%), inset 0 1px 0 var(--hud-trim);
 }
 
 * {
@@ -89,16 +92,28 @@ button {
   inset: 0;
   z-index: 8;
   pointer-events: none;
+  transition:
+    opacity 180ms ease,
+    filter 180ms ease;
+}
+
+.game-shell:has(.game-overlay) .hud {
+  filter: blur(2px);
+  opacity: 0.16;
+}
+
+.game-shell:has(.fatal-overlay) .hud {
+  opacity: 0;
 }
 
 .hud-top {
   position: absolute;
-  top: 18px;
+  top: 14px;
   left: 50%;
   display: grid;
-  grid-template-columns: minmax(180px, 0.86fr) minmax(280px, 1.3fr) minmax(140px, 0.7fr);
-  gap: 10px;
-  width: min(940px, calc(100% - 156px));
+  grid-template-columns: minmax(176px, 0.82fr) minmax(300px, 1.28fr) minmax(124px, 0.56fr);
+  gap: 8px;
+  width: min(900px, calc(100% - 154px));
   transform: translateX(-50%);
 }
 
@@ -106,37 +121,41 @@ button {
 .mission-progress,
 .size-card {
   min-width: 0;
-  border: 2px solid rgb(20 36 42 / 13%);
-  background: var(--panel);
-  box-shadow: 0 7px 22px rgb(21 48 57 / 12%);
-  backdrop-filter: blur(10px);
+  border: 1px solid rgb(255 255 255 / 56%);
+  background:
+    linear-gradient(180deg, rgb(255 255 255 / 42%), rgb(255 246 219 / 20%)),
+    var(--hud-glass);
+  box-shadow: var(--soft-depth);
+  backdrop-filter: blur(14px) saturate(1.18);
 }
 
 .era-card {
   display: grid;
   grid-template-columns: auto 1fr;
-  gap: 2px 9px;
+  gap: 1px 9px;
   align-content: center;
-  min-height: 64px;
-  padding: 10px 14px;
-  border-radius: 17px 8px 17px 8px;
+  min-height: 54px;
+  padding: 8px 12px;
+  border-radius: 15px 7px 15px 7px;
 }
 
 .era-card .era-number {
   grid-row: 1 / span 2;
   align-self: center;
-  padding: 6px 7px;
+  padding: 5px 7px;
   border-radius: 8px;
-  background: var(--ink);
+  background:
+    linear-gradient(180deg, rgb(255 255 255 / 16%), transparent),
+    var(--ink);
   color: white;
   font-size: 10px;
   font-weight: 900;
-  letter-spacing: 0.04em;
+  letter-spacing: 0;
 }
 
 .era-card strong {
   overflow: hidden;
-  font-size: 14px;
+  font-size: 13px;
   line-height: 1.2;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -152,9 +171,10 @@ button {
   display: flex;
   flex-direction: column;
   justify-content: center;
-  gap: 8px;
-  padding: 10px 16px;
-  border-radius: 9px 18px 9px 18px;
+  gap: 6px;
+  min-height: 54px;
+  padding: 8px 14px;
+  border-radius: 7px 15px 7px 15px;
 }
 
 .mission-row {
@@ -162,17 +182,17 @@ button {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 850;
 }
 
 .mission-row strong {
   white-space: nowrap;
-  font-size: 15px;
+  font-size: 14px;
 }
 
 .progress-track {
-  height: 8px;
+  height: 6px;
   overflow: hidden;
   border-radius: 999px;
   background: rgb(20 36 42 / 12%);
@@ -191,8 +211,9 @@ button {
   justify-content: center;
   align-items: flex-end;
   gap: 1px;
-  padding: 9px 14px;
-  border-radius: 17px 8px 17px 8px;
+  min-height: 54px;
+  padding: 8px 12px;
+  border-radius: 15px 7px 15px 7px;
 }
 
 .size-card span {
@@ -203,21 +224,25 @@ button {
 
 .size-card strong {
   color: #d54f31;
-  font-size: clamp(19px, 2vw, 27px);
+  font-size: clamp(18px, 1.8vw, 24px);
   line-height: 1;
-  letter-spacing: -0.04em;
+  letter-spacing: 0;
 }
 
 .timer-bar {
   position: absolute;
-  top: 91px;
+  top: 75px;
   left: 50%;
-  width: min(540px, calc(100% - 220px));
-  height: 8px;
+  width: min(520px, calc(100% - 236px));
+  height: 7px;
   overflow: visible;
-  border: 2px solid rgb(20 36 42 / 12%);
+  border: 1px solid rgb(255 255 255 / 64%);
   border-radius: 999px;
-  background: rgb(255 255 255 / 54%);
+  background: rgb(255 253 244 / 48%);
+  box-shadow:
+    0 10px 24px rgb(8 30 38 / 13%),
+    inset 0 1px 2px rgb(20 36 42 / 12%);
+  backdrop-filter: blur(10px);
   transform: translateX(-50%);
 }
 
@@ -225,54 +250,62 @@ button {
   display: block;
   height: 100%;
   border-radius: 999px;
-  background: linear-gradient(90deg, #4fcba3, #f5c74a, #ef6942);
+  background:
+    linear-gradient(180deg, rgb(255 255 255 / 62%), transparent 55%),
+    linear-gradient(90deg, #4fcba3, #f5c74a, #ef6942);
+  box-shadow: 0 0 16px rgb(246 202 62 / 38%);
   transition: width 220ms linear;
 }
 
 .timer-bar b {
   position: absolute;
-  top: -7px;
-  right: -56px;
-  width: 48px;
+  top: -8px;
+  right: -52px;
+  width: 46px;
   color: white;
-  font-size: 12px;
+  font-size: 11px;
   text-shadow: 0 1px 5px rgb(20 36 42 / 55%);
 }
 
 .theme-strip {
   position: absolute;
-  bottom: 19px;
+  bottom: 18px;
   left: 50%;
   display: flex;
-  gap: 7px;
+  gap: 6px;
+  padding: 5px;
+  border: 1px solid rgb(255 255 255 / 42%);
+  border-radius: 19px 7px 19px 7px;
+  background: rgb(20 36 42 / 24%);
+  box-shadow: 0 13px 30px rgb(8 30 38 / 15%);
+  backdrop-filter: blur(12px) saturate(1.1);
   transform: translateX(-50%);
 }
 
 .theme-chip {
   display: grid;
-  grid-template-columns: 30px auto auto;
-  gap: 6px;
+  grid-template-columns: 28px auto auto;
+  gap: 5px;
   align-items: center;
-  min-width: 90px;
-  padding: 5px 9px 5px 5px;
-  border: 2px solid rgb(20 36 42 / 12%);
-  border-radius: 14px 6px 14px 6px;
-  background: rgb(255 253 244 / 84%);
-  box-shadow: 0 8px 20px rgb(21 48 57 / 12%);
-  opacity: 0.82;
-  backdrop-filter: blur(8px);
+  min-width: 82px;
+  padding: 4px 8px 4px 4px;
+  border: 1px solid rgb(255 255 255 / 54%);
+  border-radius: 13px 5px 13px 5px;
+  background: rgb(255 253 244 / 80%);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 58%);
+  opacity: 0.86;
 }
 
 .theme-chip.is-focus {
-  border-color: rgb(20 36 42 / 45%);
+  border-color: rgb(255 255 255 / 86%);
   opacity: 1;
-  transform: translateY(-4px);
+  transform: translateY(-3px);
 }
 
 .theme-chip > span {
   display: grid;
-  width: 30px;
-  height: 30px;
+  width: 28px;
+  height: 28px;
   place-items: center;
   border-radius: 10px 4px 10px 4px;
   color: white;
@@ -293,23 +326,26 @@ button {
 
 .hud-actions {
   position: absolute;
-  top: 18px;
-  right: 18px;
+  top: 14px;
+  right: 14px;
   display: flex;
-  gap: 7px;
+  gap: 6px;
   pointer-events: auto;
 }
 
 .icon-button {
   display: grid;
-  width: 40px;
-  height: 40px;
+  width: 44px;
+  height: 44px;
   padding: 0;
   place-items: center;
-  border: 2px solid rgb(20 36 42 / 18%);
-  border-radius: 13px 5px 13px 5px;
-  background: rgb(255 253 244 / 90%);
-  box-shadow: 0 7px 20px rgb(21 48 57 / 12%);
+  border: 1px solid rgb(255 255 255 / 58%);
+  border-radius: 14px 6px 14px 6px;
+  background:
+    linear-gradient(180deg, rgb(255 255 255 / 48%), rgb(255 253 244 / 72%)),
+    rgb(255 253 244 / 82%);
+  box-shadow: var(--soft-depth);
+  backdrop-filter: blur(12px);
   font-weight: 950;
   cursor: pointer;
 }
@@ -325,14 +361,15 @@ button {
 
 .game-message {
   position: absolute;
-  top: 118px;
+  top: 103px;
   left: 50%;
   max-width: min(560px, calc(100% - 44px));
   padding: 9px 16px;
-  border: 2px solid rgb(20 36 42 / 14%);
-  border-radius: 8px 16px 8px 16px;
-  background: rgb(255 253 244 / 90%);
-  box-shadow: 0 8px 24px rgb(21 48 57 / 15%);
+  border: 1px solid rgb(255 255 255 / 58%);
+  border-radius: 8px 15px 8px 15px;
+  background: rgb(255 253 244 / 82%);
+  box-shadow: 0 12px 30px rgb(8 30 38 / 15%), inset 0 1px 0 rgb(255 255 255 / 58%);
+  backdrop-filter: blur(12px);
   font-size: 13px;
   font-weight: 850;
   text-align: center;
@@ -349,7 +386,9 @@ button {
   align-items: center;
   padding: 7px 14px;
   border-radius: 14px;
-  background: rgb(20 36 42 / 78%);
+  background:
+    linear-gradient(180deg, rgb(255 255 255 / 10%), transparent),
+    rgb(20 36 42 / 78%);
   color: white;
   box-shadow: 0 8px 24px rgb(20 36 42 / 18%);
   transform: translateX(-50%);
@@ -378,11 +417,11 @@ button {
   gap: 5px;
   width: 128px;
   padding: 8px 10px;
-  border: 2px solid rgb(20 36 42 / 12%);
+  border: 1px solid rgb(255 255 255 / 48%);
   border-radius: 12px 5px 12px 5px;
-  background: rgb(255 253 244 / 84%);
-  box-shadow: 0 8px 20px rgb(21 48 57 / 12%);
-  backdrop-filter: blur(8px);
+  background: rgb(255 253 244 / 78%);
+  box-shadow: var(--soft-depth);
+  backdrop-filter: blur(12px);
 }
 
 .boost-meter > span {
@@ -444,9 +483,10 @@ kbd {
   place-items: center;
   padding: 28px;
   background:
-    linear-gradient(130deg, rgb(19 45 53 / 28%), rgb(19 45 53 / 6%)),
-    radial-gradient(circle at 50% 46%, rgb(255 255 255 / 2%), rgb(11 31 38 / 22%));
-  backdrop-filter: blur(3px);
+    linear-gradient(130deg, rgb(11 31 38 / 44%), rgb(19 45 53 / 11%)),
+    radial-gradient(circle at 50% 39%, rgb(255 255 255 / 14%), transparent 32%),
+    radial-gradient(circle at 50% 88%, rgb(246 202 62 / 15%), rgb(11 31 38 / 26%) 58%);
+  backdrop-filter: blur(5px) saturate(1.08);
 }
 
 .fatal-overlay {
@@ -456,31 +496,36 @@ kbd {
 }
 
 .intro-overlay {
-  grid-template-columns: minmax(380px, 630px) minmax(190px, 260px);
-  gap: clamp(28px, 5vw, 80px);
+  grid-template-columns: minmax(390px, 660px) minmax(190px, 248px);
+  gap: clamp(22px, 4vw, 58px);
   justify-content: center;
 }
 
 .intro-panel,
 .result-panel {
   position: relative;
-  border: 3px solid rgb(20 36 42 / 16%);
+  border: 1px solid rgb(255 255 255 / 54%);
   background:
-    linear-gradient(rgb(255 253 244 / 95%), rgb(255 251 232 / 95%)),
+    linear-gradient(145deg, rgb(255 255 255 / 92%), rgb(255 248 224 / 88%)),
     var(--paper);
-  box-shadow: var(--shadow);
+  box-shadow:
+    var(--shadow),
+    inset 0 1px 0 rgb(255 255 255 / 86%),
+    inset 0 -12px 36px rgb(246 202 62 / 8%);
+  backdrop-filter: blur(16px) saturate(1.1);
 }
 
 .intro-panel {
-  padding: clamp(30px, 4vw, 54px);
-  border-radius: 44px 13px 44px 13px;
+  overflow: hidden;
+  padding: clamp(32px, 4.2vw, 58px);
+  border-radius: 38px 12px 38px 12px;
 }
 
 .intro-panel::before,
 .result-panel::before {
   position: absolute;
   inset: 10px;
-  border: 1px dashed rgb(20 36 42 / 18%);
+  border: 1px solid rgb(20 36 42 / 10%);
   border-radius: inherit;
   pointer-events: none;
   content: "";
@@ -492,10 +537,12 @@ kbd {
   right: 42px;
   width: 104px;
   height: 104px;
-  border: 4px solid rgb(20 36 42 / 14%);
+  border: 1px solid rgb(255 255 255 / 70%);
   border-radius: 50%;
-  background: var(--yellow);
-  box-shadow: 0 14px 28px rgb(20 36 42 / 18%);
+  background:
+    radial-gradient(circle at 35% 26%, rgb(255 255 255 / 72%), transparent 24%),
+    var(--yellow);
+  box-shadow: 0 18px 34px rgb(20 36 42 / 20%), inset 0 -8px 18px rgb(224 111 54 / 18%);
 }
 
 .brand-mark i {
@@ -532,7 +579,7 @@ kbd {
   color: #ba4e30;
   font-size: 12px;
   font-weight: 900;
-  letter-spacing: 0.05em;
+  letter-spacing: 0;
 }
 
 .intro-panel h1 {
@@ -541,7 +588,7 @@ kbd {
   margin: 0;
   font-size: clamp(42px, 5.2vw, 76px);
   line-height: 0.96;
-  letter-spacing: -0.075em;
+  letter-spacing: 0;
 }
 
 .intro-panel h1 span {
@@ -579,9 +626,10 @@ kbd {
   align-items: center;
   gap: 5px;
   padding: 4px 9px 4px 4px;
-  border: 1px solid rgb(20 36 42 / 12%);
+  border: 1px solid rgb(255 255 255 / 64%);
   border-radius: 9px 4px 9px 4px;
-  background: white;
+  background: rgb(255 255 255 / 74%);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 72%);
   font-size: 11px;
   font-weight: 850;
 }
@@ -606,10 +654,12 @@ kbd {
   width: min(100%, 330px);
   min-height: 58px;
   padding: 8px 9px 8px 21px;
-  border: 3px solid var(--ink);
+  border: 1px solid rgb(255 255 255 / 68%);
   border-radius: 17px 6px 17px 6px;
-  background: var(--yellow);
-  box-shadow: 5px 6px 0 var(--ink);
+  background:
+    linear-gradient(180deg, rgb(255 255 255 / 46%), transparent 55%),
+    var(--yellow);
+  box-shadow: 0 13px 28px rgb(130 68 22 / 20%), inset 0 -4px 0 rgb(20 36 42 / 16%);
   font-size: 16px;
   font-weight: 950;
   cursor: pointer;
@@ -630,13 +680,13 @@ kbd {
 }
 
 .primary-button:hover {
-  box-shadow: 3px 4px 0 var(--ink);
-  transform: translate(2px, 2px);
+  box-shadow: 0 10px 22px rgb(130 68 22 / 18%), inset 0 -3px 0 rgb(20 36 42 / 16%);
+  transform: translateY(2px);
 }
 
 .primary-button:active {
-  box-shadow: 0 0 0 var(--ink);
-  transform: translate(5px, 6px);
+  box-shadow: 0 6px 16px rgb(130 68 22 / 14%), inset 0 2px 8px rgb(20 36 42 / 14%);
+  transform: translateY(5px);
 }
 
 .start-tip {
@@ -662,10 +712,11 @@ kbd {
   gap: 1px 10px;
   align-items: center;
   padding: 10px 13px;
-  border: 2px solid rgb(20 36 42 / 14%);
+  border: 1px solid rgb(255 255 255 / 58%);
   border-radius: 15px 6px 15px 6px;
-  background: rgb(255 253 244 / 89%);
-  box-shadow: 0 8px 20px rgb(21 48 57 / 11%);
+  background: rgb(255 253 244 / 78%);
+  box-shadow: var(--soft-depth);
+  backdrop-filter: blur(10px);
 }
 
 .timeline-preview > div::after {
@@ -706,8 +757,8 @@ kbd {
 }
 
 .compact-overlay {
-  background: rgb(17 40 48 / 35%);
-  backdrop-filter: blur(8px);
+  background: rgb(17 40 48 / 43%);
+  backdrop-filter: blur(11px) saturate(1.1);
 }
 
 .result-panel {
@@ -724,7 +775,7 @@ kbd {
   margin: 0;
   font-size: clamp(28px, 5vw, 44px);
   line-height: 1.1;
-  letter-spacing: -0.055em;
+  letter-spacing: 0;
 }
 
 .result-panel > p:not(.eyebrow) {
@@ -762,10 +813,10 @@ kbd {
   height: 70px;
   margin: -12px auto 19px;
   place-items: center;
-  border: 3px solid var(--ink);
+  border: 1px solid rgb(255 255 255 / 70%);
   border-radius: 50%;
   background: var(--yellow);
-  box-shadow: 4px 5px 0 var(--ink);
+  box-shadow: 0 13px 28px rgb(20 36 42 / 18%), inset 0 -6px 14px rgb(224 111 54 / 14%);
   font-size: 30px;
   font-weight: 950;
 }
@@ -848,8 +899,8 @@ kbd {
 
 @media (max-width: 900px) {
   .hud-top {
-    grid-template-columns: minmax(155px, 0.9fr) minmax(220px, 1.2fr) 105px;
-    width: calc(100% - 118px);
+    grid-template-columns: minmax(150px, 0.9fr) minmax(216px, 1.2fr) 104px;
+    width: calc(100% - 126px);
   }
 
   .size-card {
@@ -896,16 +947,17 @@ kbd {
 
   .hud-top {
     top: 8px;
-    grid-template-columns: 1fr 104px;
-    gap: 6px;
-    width: calc(100% - 74px);
-    transform: translateX(calc(-50% - 25px));
+    left: 8px;
+    grid-template-columns: minmax(0, 1fr) 90px;
+    gap: 5px;
+    width: calc(100% - 166px);
+    transform: none;
   }
 
   .era-card {
-    min-height: 52px;
+    min-height: 48px;
     padding: 6px 8px;
-    border-radius: 13px 5px 13px 5px;
+    border-radius: 12px 5px 12px 5px;
   }
 
   .era-card .era-number {
@@ -914,6 +966,7 @@ kbd {
   }
 
   .era-card strong {
+    max-width: 100%;
     font-size: 11px;
   }
 
@@ -923,15 +976,23 @@ kbd {
 
   .mission-progress {
     position: absolute;
-    top: 58px;
+    top: 53px;
     left: 0;
-    width: 100%;
-    padding: 7px 10px;
+    width: 142px;
+    min-height: 38px;
+    padding: 5px 8px;
     border-radius: 6px 12px 6px 12px;
   }
 
   .mission-row {
+    gap: 6px;
     font-size: 10px;
+  }
+
+  .mission-row span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .mission-row strong {
@@ -939,7 +1000,8 @@ kbd {
   }
 
   .size-card {
-    min-height: 52px;
+    min-height: 48px;
+    padding-inline: 8px;
   }
 
   .size-card span {
@@ -947,51 +1009,62 @@ kbd {
   }
 
   .size-card strong {
-    font-size: 18px;
+    font-size: 16px;
   }
 
   .timer-bar {
-    top: 110px;
-    width: calc(100% - 154px);
+    top: 99px;
+    width: min(312px, calc(100% - 78px));
+    height: 5px;
+  }
+
+  .timer-bar b {
+    top: -7px;
+    right: -43px;
+    width: 39px;
+    font-size: 10px;
   }
 
   .hud-actions {
     top: 8px;
     right: 8px;
-    flex-direction: column;
+    flex-direction: row;
     gap: 5px;
   }
 
   .icon-button {
-    width: 34px;
-    height: 34px;
+    width: 44px;
+    height: 44px;
     border-radius: 10px 4px 10px 4px;
     font-size: 12px;
   }
 
   .game-message {
-    top: 154px;
+    top: 113px;
     padding: 7px 12px;
     font-size: 11px;
   }
 
   .theme-strip {
-    top: 117px;
+    top: 61px;
+    left: calc(50% + 42px);
     bottom: auto;
-    gap: 3px;
+    gap: 2px;
+    max-width: 170px;
+    padding: 2px;
   }
 
   .theme-chip {
-    grid-template-columns: 23px auto;
-    gap: 3px;
+    grid-template-columns: 21px auto;
+    gap: 2px;
     min-width: 0;
-    padding: 3px 5px 3px 3px;
+    padding: 2px 4px 2px 2px;
     border-radius: 10px 4px 10px 4px;
   }
 
   .theme-chip > span {
-    width: 23px;
-    height: 23px;
+    width: 21px;
+    height: 21px;
     border-radius: 8px 3px 8px 3px;
     font-size: 10px;
   }
@@ -1001,7 +1074,8 @@ kbd {
   }
 
   .theme-chip em {
-    font-size: 9px;
+    min-width: 7px;
+    font-size: 8px;
   }
 
   .theme-chip.is-focus {
@@ -1009,7 +1083,18 @@ kbd {
   }
 
   .nearby-label {
-    bottom: 121px;
+    bottom: 129px;
+    flex-direction: row;
+    gap: 4px;
+    padding: 5px 9px;
+  }
+
+  .nearby-label span {
+    display: none;
+  }
+
+  .nearby-label strong {
+    font-size: 11px;
   }
 
   .boost-meter,
@@ -1088,20 +1173,20 @@ kbd {
   }
 
   .game-overlay {
-    padding: 15px;
+    padding: 14px;
   }
 
   .intro-overlay {
     display: flex;
     flex-direction: column;
     justify-content: center;
-    gap: 12px;
+    gap: 10px;
   }
 
   .intro-panel {
     width: min(100%, 560px);
-    padding: 29px 24px 24px;
-    border-radius: 30px 10px 30px 10px;
+    padding: 28px 22px 22px;
+    border-radius: 28px 10px 28px 10px;
   }
 
   .brand-mark {
@@ -1142,14 +1227,14 @@ kbd {
   }
 
   .primary-button {
-    min-height: 51px;
+    min-height: 54px;
     padding-left: 17px;
     font-size: 14px;
   }
 
   .primary-button b {
-    width: 35px;
-    height: 35px;
+    width: 40px;
+    height: 40px;
   }
 
   .timeline-preview {
@@ -1181,7 +1266,7 @@ kbd {
   }
 
   .intro-panel {
-    padding-top: 22px;
+    padding: 22px 18px 19px;
   }
 
   .brand-mark {
@@ -1197,6 +1282,7 @@ kbd {
   .intro-copy {
     margin-block: 12px 10px;
     font-size: 12px;
+    line-height: 1.42;
   }
 
   .start-tip {
