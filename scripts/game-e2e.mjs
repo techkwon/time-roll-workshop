@@ -477,17 +477,62 @@ try {
   assert.equal(state.mode, "playing");
   checks.push("pause and resume");
 
+  await callTestHook(desktop, "setCameraHeading", 0);
+  state = await readState(desktop);
+  const idleCamera = state.camera;
   await desktop.keyboard.down("ArrowRight");
-  await desktop.evaluate(() => window.advanceTime?.(700));
+  await desktop.keyboard.down("Shift");
+  await desktop.evaluate(() => window.advanceTime?.(900));
+  await desktop.keyboard.up("Shift");
   await desktop.keyboard.up("ArrowRight");
   state = await readState(desktop);
   assert.ok(state.player.x > 0.1);
+  assert.ok(state.camera.speed01 > 0.08, `dynamic camera should register movement speed; speed01=${state.camera.speed01}`);
+  const dynamicCameraDelta = {
+    heading: Number(angleDistance(state.camera.heading, idleCamera.heading).toFixed(3)),
+    bank: Number(Math.abs(state.camera.bank - idleCamera.bank).toFixed(3)),
+    fovDegrees: Number(Math.abs(state.camera.fovDegrees - idleCamera.fovDegrees).toFixed(1)),
+  };
+  assert.ok(
+    dynamicCameraDelta.heading > 0.03 || dynamicCameraDelta.bank > 0.004 || dynamicCameraDelta.fovDegrees > 0.5,
+    `dynamic camera should change heading, bank, or FOV while moving; delta=${JSON.stringify(dynamicCameraDelta)}`,
+  );
+  const playerFraming = state.playerFraming;
+  assert.ok(
+    state.player.radius >= 0.25 && state.player.growthRatio >= 0.18,
+    `dynamic camera framing should exercise a meaningfully grown time ball; player=${JSON.stringify(state.player)}`,
+  );
+  assert.ok(
+    playerFraming?.ballBounds && playerFraming?.viewport,
+    `dynamic camera framing should expose actual time-ball projection; framing=${JSON.stringify(playerFraming)}`,
+  );
+  assert.ok(
+    playerFraming.radiusPx > 20 && playerFraming.center,
+    `dynamic camera framing should describe the visible time ball, not background geometry; framing=${JSON.stringify(playerFraming)}`,
+  );
+  const framingTolerancePx = 1;
+  assert.ok(
+    playerFraming.ballBounds.left >= -framingTolerancePx &&
+      playerFraming.ballBounds.top >= -framingTolerancePx &&
+      playerFraming.ballBounds.right <= playerFraming.viewport.width + framingTolerancePx &&
+      playerFraming.ballBounds.bottom <= playerFraming.viewport.height + framingTolerancePx,
+    `grown time ball should remain fully inside gameplay viewport during boosted dynamic camera; framing=${JSON.stringify(playerFraming)} camera=${JSON.stringify(state.camera)}`,
+  );
+  await captureCanvas(desktop, "desktop-playing-dynamic.png");
+  observations.dynamicCameraRegression = {
+    idleCamera,
+    movingCamera: state.camera,
+    delta: dynamicCameraDelta,
+    boostAfterMove: state.boost,
+    playerFraming,
+    screenshot: "desktop-playing-dynamic.png",
+  };
   await desktop.keyboard.press("KeyR");
   state = await readState(desktop);
   assert.equal(state.era.index, 2);
   assert.equal(state.player.x, 0);
   assert.equal(state.player.z, 0);
-  checks.push("movement and era retry");
+  checks.push("movement, boost-responsive dynamic camera, and era retry");
 
   const eraLandmarkLabels = [
     "Era 1 Manufacturing",

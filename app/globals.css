@@ -1215,28 +1215,28 @@ kbd {
   }
 
   .hud-top {
-    top: 8px;
-    left: 8px;
-    grid-template-columns: minmax(0, 1fr) 90px;
-    gap: 5px;
-    width: calc(100% - 166px);
+    top: 6px;
+    left: 6px;
+    grid-template-columns: minmax(0, 1fr) 78px;
+    gap: 4px;
+    width: calc(100% - 144px);
     transform: none;
   }
 
   .era-card {
-    min-height: 48px;
-    padding: 6px 8px;
+    min-height: 40px;
+    padding: 4px 7px;
     border-radius: 12px 5px 12px 5px;
   }
 
   .era-card .era-number {
-    padding: 5px;
+    padding: 4px;
     font-size: 8px;
   }
 
   .era-card strong {
     max-width: 100%;
-    font-size: 11px;
+    font-size: 10px;
   }
 
   .era-card > span:last-child {
@@ -1245,17 +1245,17 @@ kbd {
 
   .mission-progress {
     position: absolute;
-    top: 53px;
+    top: 45px;
     left: 0;
-    width: 142px;
-    min-height: 38px;
-    padding: 5px 8px;
+    width: 124px;
+    min-height: 31px;
+    padding: 4px 7px;
     border-radius: 6px 12px 6px 12px;
   }
 
   .mission-row {
-    gap: 6px;
-    font-size: 10px;
+    gap: 5px;
+    font-size: 9px;
   }
 
   .mission-row span {
@@ -1265,12 +1265,12 @@ kbd {
   }
 
   .mission-row strong {
-    font-size: 11px;
+    font-size: 10px;
   }
 
   .size-card {
-    min-height: 48px;
-    padding-inline: 8px;
+    min-height: 40px;
+    padding-inline: 7px;
   }
 
   .size-card span {
@@ -1278,48 +1278,53 @@ kbd {
   }
 
   .size-card strong {
-    font-size: 16px;
+    font-size: 14px;
   }
 
   .timer-bar {
-    top: 99px;
-    width: min(312px, calc(100% - 78px));
-    height: 5px;
+    top: 83px;
+    width: min(292px, calc(100% - 72px));
+    height: 4px;
   }
 
   .timer-bar b {
-    top: -7px;
-    right: -43px;
-    width: 39px;
-    font-size: 10px;
+    top: -6px;
+    right: -39px;
+    width: 35px;
+    font-size: 9px;
   }
 
   .hud-actions {
-    top: 8px;
-    right: 8px;
+    top: 6px;
+    right: 6px;
     flex-direction: row;
-    gap: 5px;
+    gap: 4px;
   }
 
   .icon-button {
-    width: 44px;
-    height: 44px;
+    width: 40px;
+    height: 40px;
     border-radius: 10px 4px 10px 4px;
-    font-size: 12px;
-  }
-
-  .game-message {
-    top: 164px;
-    padding: 7px 12px;
     font-size: 11px;
   }
 
+  .game-message {
+    top: 124px;
+    max-width: min(360px, calc(100% - 84px));
+    padding: 6px 10px;
+    font-size: 10px;
+  }
+
   .growth-panel {
-    top: 108px;
-    left: 8px;
-    width: calc(100% - 16px);
+    top: 84px;
+    left: 6px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(118px, 0.94fr);
+    gap: 3px 8px;
+    align-items: center;
+    width: calc(100% - 12px);
     min-width: 0;
-    padding: 7px 9px;
+    padding: 4px 8px;
   }
 
   .growth-row {
@@ -1328,11 +1333,16 @@ kbd {
   }
 
   .growth-track {
-    margin-block: 5px;
+    grid-column: 1 / -1;
+    height: 4px;
+    margin-block: 1px;
   }
 
   .growth-meta {
+    grid-column: 2;
+    grid-row: 1;
     font-size: 8px;
+    line-height: 1.15;
   }
 
   .score-strip {
@@ -1340,16 +1350,16 @@ kbd {
   }
 
   .theme-strip {
-    top: 61px;
-    left: calc(50% + 42px);
+    top: 49px;
+    left: calc(50% + 28px);
     bottom: auto;
     gap: 2px;
-    max-width: 170px;
+    max-width: 156px;
     padding: 2px;
   }
 
   .theme-chip {
-    grid-template-columns: 21px auto;
+    grid-template-columns: 19px auto;
     gap: 2px;
     min-width: 0;
     padding: 2px 4px 2px 2px;
@@ -1357,10 +1367,10 @@ kbd {
   }
 
   .theme-chip > span {
-    width: 21px;
-    height: 21px;
+    width: 19px;
+    height: 19px;
     border-radius: 8px 3px 8px 3px;
-    font-size: 10px;
+    font-size: 9px;
   }
 
   .theme-chip b {
@@ -1377,10 +1387,10 @@ kbd {
   }
 
   .nearby-label {
-    bottom: 129px;
+    bottom: 110px;
     flex-direction: row;
     gap: 4px;
-    padding: 5px 9px;
+    padding: 5px 8px;
   }
 
   .nearby-label span {
@@ -1398,12 +1408,12 @@ kbd {
 
   .touch-controls {
     position: absolute;
-    inset: auto 0 20px;
+    inset: auto 0 14px;
     z-index: 12;
     display: flex;
     justify-content: space-between;
     align-items: flex-end;
-    padding-inline: 20px;
+    padding-inline: 16px;
     pointer-events: none;
   }
 
@@ -1414,8 +1424,8 @@ kbd {
 
   .joystick {
     position: relative;
-    width: 120px;
-    height: 120px;
+    width: 104px;
+    height: 104px;
     border: 2px solid rgb(255 255 255 / 56%);
     border-radius: 50%;
     background:
@@ -1429,10 +1439,10 @@ kbd {
 
   .joystick-knob {
     position: absolute;
-    top: 34px;
-    left: 34px;
-    width: 52px;
-    height: 52px;
+    top: 29px;
+    left: 29px;
+    width: 46px;
+    height: 46px;
     border: 3px solid var(--ink);
     border-radius: 50%;
     background: var(--yellow);
@@ -1442,8 +1452,8 @@ kbd {
 
   .boost-button {
     display: flex;
-    width: 92px;
-    height: 92px;
+    width: 84px;
+    height: 84px;
     flex-direction: column;
     justify-content: center;
     align-items: center;
@@ -1457,7 +1467,7 @@ kbd {
   }
 
   .boost-button span {
-    font-size: 28px;
+    font-size: 24px;
     line-height: 1;
   }
 
@@ -1655,20 +1665,20 @@ kbd {
   }
 
   .joystick {
-    width: 104px;
-    height: 104px;
+    width: 94px;
+    height: 94px;
   }
 
   .joystick-knob {
-    top: 29px;
-    left: 29px;
-    width: 46px;
-    height: 46px;
+    top: 26px;
+    left: 26px;
+    width: 42px;
+    height: 42px;
   }
 
   .boost-button {
-    width: 82px;
-    height: 82px;
+    width: 76px;
+    height: 76px;
   }
 }
 
