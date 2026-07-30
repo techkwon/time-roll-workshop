@@ -1,6 +1,33 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  BOSS_RADIUS_RATIO,
+  GROWTH_TIERS,
+  absorbRadius,
+  canCollect as canCollectByRule,
+  formatPhysicalSize,
+  growthRatio as getGrowthRatio,
+  growthTier as getGrowthTier,
+  nextTier as getNextTier,
+  requiredPlayerRadius,
+  startingRadius,
+  type GrowthTierId,
+} from "./timeRollRules";
+import {
+  TIME_ROLL_ENDING,
+  TIME_ROLL_ERA_STORIES,
+  TIME_ROLL_INTRO_TEASER,
+  TIME_ROLL_PROTAGONIST,
+  getTimeRollEraStory,
+} from "./timeRollStory";
+import {
+  defaultProgress,
+  parseProgressJson,
+  recordEraResult,
+  serializeProgress,
+  type TimeRollProgressV2,
+} from "./timeRollProgress";
 
 type ThemeId = "manufacturing" | "construction" | "transport" | "communication" | "life";
 type GameMode = "intro" | "playing" | "paused" | "eraClear" | "victory" | "timeUp";
@@ -89,7 +116,18 @@ type GameState = {
   seed: number;
   reducedMotion: boolean;
   lowQuality: boolean;
+  bossReady: boolean;
   finalReady: boolean;
+  growthTier: GrowthTierId;
+  growthRatio: number;
+  nextUnlockRatio: number | null;
+  score: number;
+  combo: number;
+  maxCombo: number;
+  eraScore: number;
+  comboTimer: number;
+  lastCollection: string;
+  blockedCollision: string;
 };
 
 type HudSnapshot = {
@@ -105,7 +143,21 @@ type HudSnapshot = {
   message: string;
   nearbyName: string;
   nearbyCanCollect: boolean;
+  bossReady: boolean;
   finalReady: boolean;
+  growthTier: GrowthTierId;
+  growthTierLabel: string;
+  growthRatio: number;
+  nextUnlockRatio: number | null;
+  nextCollectSize: string;
+  bossName: string;
+  bossCollected: boolean;
+  score: number;
+  combo: number;
+  maxCombo: number;
+  eraScore: number;
+  lastCollection: string;
+  blockedCollision: string;
   bestEra: number;
   bestSize: number;
 };
@@ -140,6 +192,11 @@ declare global {
     advanceTime?: (ms: number) => void | Promise<void>;
     __timeRollTest?: {
       start: () => void;
+      startEra: (index: number) => void;
+      setRadiusRatio: (ratio: number) => void;
+      collectItem: (id: number) => boolean;
+      warpToItem: (id: number) => boolean;
+      unlockBoss: () => void;
       completeEra: () => void;
       nextEra: () => void;
       retry: () => void;
@@ -337,9 +394,13 @@ function vecDot([ax, ay, az]: Vec3, [bx, by, bz]: Vec3) {
 }
 
 function createCameraState(state: GameState): CameraState {
+  const era = ERAS[state.era];
+  const base = era.baseRadius;
+  const radius = Math.max(state.radius, startingRadius(base));
+  const frameRadius = mix(base, radius, 0.55);
   return {
-    eye: [state.x, state.radius * 5.15, state.z + state.radius * 8.7],
-    target: [state.x, state.radius * 0.92, state.z - state.radius * 4.15],
+    eye: [state.x, frameRadius * 5.15, state.z + frameRadius * 8.7],
+    target: [state.x, radius * 0.92, state.z - frameRadius * 4.15],
     up: [0, 1, 0],
     heading: 0,
     bank: 0,
@@ -364,12 +425,15 @@ function resetCamera(camera: CameraState, state: GameState) {
 }
 
 function updateCamera(camera: CameraState, state: GameState, dt: number) {
-  const radius = Math.max(state.radius, 0.01);
+  const base = ERAS[state.era].baseRadius;
+  const radius = Math.max(state.radius, startingRadius(base));
+  const growth = clamp(getGrowthRatio(radius, base), 0.18, 1.4);
+  const frameRadius = mix(base, radius, 0.5);
   const speed = Math.hypot(state.vx, state.vz);
-  const speed01 = clamp(speed / (radius * 9.2), 0, 1);
+  const speed01 = clamp(speed / (base * mix(2.8, 7.2, growth)), 0, 1);
   const desiredHeading = state.reducedMotion
     ? 0
-    : speed > radius * 0.16
+    : speed > base * 0.035
       ? Math.atan2(state.vx, -state.vz)
       : camera.heading;
   const headingDelta = wrapAngle(desiredHeading - camera.heading);
@@ -380,7 +444,7 @@ function updateCamera(camera: CameraState, state: GameState, dt: number) {
 
   const turnImpulse =
     (state.vx * camera.previousVz - state.vz * camera.previousVx) /
-    Math.max(radius * radius * 42, 0.01);
+    Math.max(base * base * 42, 0.01);
   const desiredBank = state.reducedMotion
     ? 0
     : clamp(turnImpulse * 2.8 + headingDelta * 0.8, -1, 1) * 0.22;
@@ -399,22 +463,22 @@ function updateCamera(camera: CameraState, state: GameState, dt: number) {
   const rightX = Math.cos(camera.heading);
   const rightZ = Math.sin(camera.heading);
   const portrait = typeof window !== "undefined" && window.innerHeight > window.innerWidth * 1.12;
-  let distance = radius * mix(7.85, 9.9, framingSpeed01);
-  let height = radius * mix(5.05, 4.5, framingSpeed01);
-  let lookAhead = radius * mix(4.5, 7.15, framingSpeed01);
+  let distance = frameRadius * mix(7.1, 9.2, framingSpeed01);
+  let height = frameRadius * mix(4.7, 4.25, framingSpeed01);
+  let lookAhead = frameRadius * mix(3.8, 6.7, framingSpeed01);
   if (portrait) {
     distance *= 1.06;
     height *= 1.22;
     lookAhead *= 1.18;
   }
   const kick = state.reducedMotion ? 0 : state.cameraKick;
-  distance += radius * kick * 0.82;
-  height += radius * kick * 0.2;
+  distance += frameRadius * kick * 0.82;
+  height += frameRadius * kick * 0.2;
 
   const desiredEye: Vec3 = [
-    state.x - forwardX * distance + rightX * camera.bank * radius * 1.8,
+    state.x - forwardX * distance + rightX * camera.bank * frameRadius * 1.8,
     height,
-    state.z - forwardZ * distance + rightZ * camera.bank * radius * 1.8,
+    state.z - forwardZ * distance + rightZ * camera.bank * frameRadius * 1.8,
   ];
   const desiredTarget: Vec3 = [
     state.x + forwardX * lookAhead,
@@ -545,6 +609,25 @@ type DrawCommand = {
   textureBlend: number;
   textureScale: [number, number];
   distanceSquared: number;
+};
+
+type RenderStats = {
+  drawCalls: number;
+  triangles: number;
+  transparentCalls: number;
+  culledItems: number;
+  renderedItems: number;
+  frameMsP95: number;
+};
+
+type ItemRenderLod = "full" | "simple";
+
+type VisibleCollectible = {
+  item: Collectible;
+  lod: ItemRenderLod;
+  drawShadow: boolean;
+  priority: number;
+  distance: number;
 };
 
 function makePlane(): RawMesh {
@@ -717,6 +800,16 @@ class WebGlToyRenderer {
   private objectAtlasLoaded = false;
   private transparentCommands: DrawCommand[] = [];
   private cameraEye: Vec3 = [0, 0, 0];
+  private renderStats: RenderStats = {
+    drawCalls: 0,
+    triangles: 0,
+    transparentCalls: 0,
+    culledItems: 0,
+    renderedItems: 0,
+    frameMsP95: 0,
+  };
+  private frameSamples: number[] = [];
+  private previousBeginTime = 0;
 
   constructor(canvas: HTMLCanvasElement, lowQuality = false) {
     const gl = canvas.getContext("webgl", {
@@ -817,17 +910,22 @@ class WebGlToyRenderer {
             baseColor = mix(baseColor, tintedMaterial, clamp(uTextureBlend, 0.0, 1.0));
           }
           float wrappedLight = clamp((dot(normal, lightDirection) + 0.22) / 1.22, 0.0, 1.0);
-          float shapedKey = smoothstep(0.08, 0.94, wrappedLight);
+          float toonRamp =
+            wrappedLight < 0.36 ? 0.28 :
+            wrappedLight < 0.72 ? 0.62 :
+            1.0;
+          float shapedKey = mix(smoothstep(0.08, 0.94, wrappedLight), toonRamp, 0.42);
           float contactTone = mix(0.78, 1.0, smoothstep(-0.32, 0.62, normal.y));
           float groundBounce = max(-normal.y, 0.0) * 0.075;
+          float rimBand = smoothstep(0.42, 0.92, rim);
           vec3 color =
             baseColor * contactTone * (0.17 + shapedKey * 0.63 + skyFill * 0.09 + backFill * 0.045 + groundBounce) +
             vec3(1.0, 0.88, 0.66) * diffuse * 0.075 +
             vec3(specular * uGloss * 0.54) +
-            mix(baseColor, vec3(1.0, 0.9, 0.64), 0.68) * rim * (0.26 + uGloss * 0.18);
+            mix(baseColor, vec3(1.0, 0.9, 0.64), 0.68) * rimBand * (0.24 + uGloss * 0.2);
           float distanceToCamera = length(uCamera - vWorld);
           float fog = smoothstep(uFogNear, uFogFar, distanceToCamera);
-          color = mix(color, uFogColor, fog * 0.58);
+          color = mix(color, uFogColor, fog * (0.5 + smoothstep(0.35, 1.0, fog) * 0.16));
           color = pow(max(color, vec3(0.0)), vec3(0.92));
           gl_FragColor = vec4(color, uAlpha);
         }
@@ -984,6 +1082,20 @@ class WebGlToyRenderer {
   begin(sky: Vec3, camera: CameraState, far: number, fogNear: number, fogFar: number) {
     this.resize();
     const gl = this.gl;
+    const now = performance.now();
+    if (this.previousBeginTime > 0) {
+      this.frameSamples.push(now - this.previousBeginTime);
+      if (this.frameSamples.length > 90) this.frameSamples.shift();
+    }
+    this.previousBeginTime = now;
+    this.renderStats = {
+      drawCalls: 0,
+      triangles: 0,
+      transparentCalls: 0,
+      culledItems: 0,
+      renderedItems: 0,
+      frameMsP95: this.sampleP95(),
+    };
     this.transparentCommands.length = 0;
     this.cameraEye = [camera.eye[0], camera.eye[1], camera.eye[2]];
     gl.clearColor(sky[0], sky[1], sky[2], 1);
@@ -1024,6 +1136,7 @@ class WebGlToyRenderer {
     textureBlend = 1,
     textureScale: number | [number, number] = 1,
   ) {
+    const resolvedAlpha = this.lowQuality && alpha >= 0.82 ? 1 : alpha;
     const textureOptions =
       typeof texture === "number"
         ? { skinTile: texture, textureBlend, textureScale }
@@ -1039,7 +1152,7 @@ class WebGlToyRenderer {
       position,
       scale,
       rotation,
-      alpha,
+      alpha: resolvedAlpha,
       gloss,
       skinTile,
       objectTile,
@@ -1050,11 +1163,12 @@ class WebGlToyRenderer {
       ],
       distanceSquared: 0,
     };
-    if (alpha < 0.999) {
+    if (resolvedAlpha < 0.999) {
       const dx = position[0] - this.cameraEye[0];
       const dy = position[1] - this.cameraEye[1];
       const dz = position[2] - this.cameraEye[2];
       this.transparentCommands.push({ ...command, distanceSquared: dx * dx + dy * dy + dz * dz });
+      this.renderStats.transparentCalls += 1;
       return;
     }
     this.drawImmediate(command);
@@ -1083,9 +1197,29 @@ class WebGlToyRenderer {
     this.transparentCommands.length = 0;
   }
 
+  recordRenderedItem() {
+    this.renderStats.renderedItems += 1;
+  }
+
+  recordCulledItem(count = 1) {
+    this.renderStats.culledItems += count;
+  }
+
+  getRenderStats(): RenderStats {
+    return { ...this.renderStats };
+  }
+
+  private sampleP95() {
+    if (this.frameSamples.length === 0) return 0;
+    const sorted = [...this.frameSamples].sort((a, b) => a - b);
+    return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))];
+  }
+
   private drawImmediate(command: DrawCommand) {
     const gl = this.gl;
     const mesh = this.meshes[command.meshName];
+    this.renderStats.drawCalls += 1;
+    this.renderStats.triangles += mesh.count / 3;
     const { position, rotation, scale } = command;
     let model = mat4Translation(position[0], position[1], position[2]);
     model = mat4Multiply(model, mat4RotationY(rotation[1]));
@@ -1139,6 +1273,48 @@ function otherFocusTheme(theme: ThemeId): ThemeId {
   return THEMES[(THEME_INDEX[theme] + 2) % THEMES.length].id;
 }
 
+function tierRangeRadius(base: number, tierId: GrowthTierId, t: number) {
+  const tier = GROWTH_TIERS.find((entry) => entry.id === tierId) ?? GROWTH_TIERS[0];
+  return base * mix(tier.itemRadiusRangeRatio[0], tier.itemRadiusRangeRatio[1], clamp(t, 0, 1));
+}
+
+function tierForPath(t: number): GrowthTierId {
+  if (t < 0.34) return "tiny";
+  if (t < 0.55) return "small";
+  if (t < 0.73) return "medium";
+  if (t < 0.9) return "large";
+  return "monument";
+}
+
+function updateGrowthState(state: GameState) {
+  const era = ERAS[state.era];
+  const tier = getGrowthTier(state.radius, era.baseRadius);
+  const next = getNextTier(state.radius, era.baseRadius);
+  state.growthTier = tier.id;
+  state.growthRatio = getGrowthRatio(state.radius, era.baseRadius);
+  state.nextUnlockRatio = next?.thresholdRatio ?? null;
+  state.finalReady = state.bossReady;
+}
+
+function collectionMultiplier(item: Collectible, focus: ThemeId) {
+  if (item.special) return 1.35;
+  return item.theme === focus ? 1.15 : 0.9;
+}
+
+function scoreForItem(item: Collectible, state: GameState) {
+  const era = ERAS[state.era];
+  const sizePoints = Math.round((item.r / era.baseRadius) * 900);
+  const focusBonus = item.theme === era.focus ? 120 : 45;
+  const specialBonus = item.special ? 1600 : 0;
+  return Math.round((sizePoints + focusBonus + specialBonus) * (1 + Math.min(state.combo, 8) * 0.12));
+}
+
+function rankFor(eraScore: number, maxCombo: number, bossCollected: boolean) {
+  if (bossCollected && eraScore >= 5200 && maxCombo >= 7) return "S";
+  if (bossCollected && eraScore >= 3400 && maxCombo >= 4) return "A";
+  return "B";
+}
+
 function generateItems(eraIndex: number, seed: number): Collectible[] {
   const era = ERAS[eraIndex];
   const random = seededRandom(seed + eraIndex * 971);
@@ -1149,6 +1325,7 @@ function generateItems(eraIndex: number, seed: number): Collectible[] {
 
   for (let index = 0; index < trailCount; index += 1) {
     const sizeT = index / Math.max(1, trailCount - 1);
+    const tier = tierForPath(sizeT);
     const kind = objectKindFor(era.focus, index);
     items.push({
       id: items.length,
@@ -1157,7 +1334,7 @@ function generateItems(eraIndex: number, seed: number): Collectible[] {
       era: eraIndex,
       x: Math.sin(index * 1.22) * base * 1.25,
       z: -base * (2.8 + index * 1.38),
-      r: base * mix(0.24, 0.57, sizeT),
+      r: tierRangeRadius(base, tier, (index % 5) / 4),
       yaw: random() * Math.PI * 2,
       shape: shapeForTheme(era.focus),
       objectKind: kind,
@@ -1180,6 +1357,7 @@ function generateItems(eraIndex: number, seed: number): Collectible[] {
     const theme = showcaseThemes[index];
     const side = index % 2 === 0 ? -1 : 1;
     const lane = Math.floor(index / 2);
+    const tier: GrowthTierId = lane === 0 ? "large" : lane === 1 ? "medium" : lane === 2 ? "small" : "large";
     const names = ITEM_NAMES[theme][eraIndex];
     const kind = objectKindFor(theme, index + eraIndex * 7 + 4);
     items.push({
@@ -1189,7 +1367,7 @@ function generateItems(eraIndex: number, seed: number): Collectible[] {
       era: eraIndex,
       x: side * base * mix(2.05, 3.15, lane / 3),
       z: -base * mix(2.7, 6.4, lane / 3),
-      r: base * mix(0.34, 0.52, lane / 3),
+      r: tierRangeRadius(base, tier, (index % 2) * 0.55 + 0.25),
       yaw: side * 0.38,
       shape: shapeForTheme(theme),
       objectKind: kind,
@@ -1208,6 +1386,7 @@ function generateItems(eraIndex: number, seed: number): Collectible[] {
       const names = ITEM_NAMES[theme][eraIndex];
       const kind = objectKindFor(theme, cluster * 3 + slot + eraIndex);
       const lateral = slot === 0 ? 0 : (slot === 1 ? -1 : 1) * base * mix(2.8, 4.6, pathT);
+      const tier = tierForPath(clamp(pathT + slot * 0.035, 0, 1));
       items.push({
         id: items.length,
         name: names[(cluster + slot) % names.length],
@@ -1215,7 +1394,7 @@ function generateItems(eraIndex: number, seed: number): Collectible[] {
         era: eraIndex,
         x: centerX + lateral + (random() - 0.5) * base * 0.74,
         z: centerZ + (random() - 0.5) * base * 1.72,
-        r: base * mix(0.22, 0.62, pathT * 0.75 + random() * 0.25),
+        r: tierRangeRadius(base, tier, random()),
         yaw: random() * Math.PI * 2,
         shape: shapeForTheme(theme),
         objectKind: kind,
@@ -1232,6 +1411,7 @@ function generateItems(eraIndex: number, seed: number): Collectible[] {
     const distance = base * mix(4.5, era.arenaUnits * 0.9, Math.sqrt(random()));
     const names = ITEM_NAMES[theme][eraIndex];
     const kind = objectKindFor(theme, index + eraIndex * 5);
+    const tier = index < 8 ? "small" : index < 18 ? "medium" : index < 26 ? "large" : "monument";
     items.push({
       id: items.length,
       name: names[Math.floor(random() * names.length)],
@@ -1239,7 +1419,7 @@ function generateItems(eraIndex: number, seed: number): Collectible[] {
       era: eraIndex,
       x: Math.cos(angle) * distance,
       z: Math.sin(angle) * distance,
-      r: base * mix(0.23, 0.78, random()),
+      r: tierRangeRadius(base, tier, random()),
       yaw: random() * Math.PI * 2,
       shape: shapeForTheme(theme),
       objectKind: kind,
@@ -1264,7 +1444,7 @@ function generateItems(eraIndex: number, seed: number): Collectible[] {
     era: eraIndex,
     x: base * 0.2,
     z: -base * 20.9,
-    r: base * (eraIndex === ERAS.length - 1 ? 0.82 : 1.08),
+    r: base * BOSS_RADIUS_RATIO,
     yaw: 0.4,
     shape: eraIndex === ERAS.length - 1 ? "sphere" : shapeForTheme(specialTheme),
     objectKind: specialKind,
@@ -1289,7 +1469,7 @@ function createState(
     z: 0,
     vx: 0,
     vz: 0,
-    radius: era.baseRadius,
+    radius: startingRadius(era.baseRadius),
     rollX: 0,
     rollZ: 0,
     timer: era.seconds,
@@ -1309,17 +1489,23 @@ function createState(
     seed,
     reducedMotion,
     lowQuality,
+    bossReady: false,
     finalReady: false,
+    growthTier: getGrowthTier(startingRadius(era.baseRadius), era.baseRadius).id,
+    growthRatio: getGrowthRatio(startingRadius(era.baseRadius), era.baseRadius),
+    nextUnlockRatio: getNextTier(startingRadius(era.baseRadius), era.baseRadius)?.thresholdRatio ?? null,
+    score: 0,
+    combo: 0,
+    maxCombo: 0,
+    eraScore: 0,
+    comboTimer: 0,
+    lastCollection: "",
+    blockedCollision: "",
   };
 }
 
 function formatSize(radius: number, era: number) {
-  const meters = radius * [0.55, 2.2, 11, 48, 170][era];
-  if (meters < 1) return `${Math.round(meters * 100)}cm`;
-  if (meters < 1000) {
-    return `${meters < 10 ? meters.toFixed(1) : Math.round(meters)}m`;
-  }
-  return `${(meters / 1000).toFixed(2)}km`;
+  return formatPhysicalSize(radius, era).replace("약 ", "");
 }
 
 function makeHud(state: GameState, bestEra: number, bestSize: number): HudSnapshot {
@@ -1333,10 +1519,11 @@ function makeHud(state: GameState, bestEra: number, bestSize: number): HudSnapsh
       nearest = item;
     }
   }
-  const canCollect =
-    !!nearest &&
-    nearest.r <= state.radius * 0.82 &&
-    (!nearest.special || state.era < ERAS.length - 1 || state.finalReady);
+  updateGrowthState(state);
+  const tier = getGrowthTier(state.radius, ERAS[state.era].baseRadius);
+  const next = getNextTier(state.radius, ERAS[state.era].baseRadius);
+  const boss = state.items.find((item) => item.special);
+  const canCollect = !!nearest && canCollectByRule(state, nearest, state.bossReady);
   return {
     mode: state.mode,
     era: state.era,
@@ -1350,7 +1537,23 @@ function makeHud(state: GameState, bestEra: number, bestSize: number): HudSnapsh
     message: state.messageTime > 0 ? state.message : "",
     nearbyName: nearestDistance < state.radius * 8 && nearest ? nearest.name : "",
     nearbyCanCollect: canCollect,
+    bossReady: state.bossReady,
     finalReady: state.finalReady,
+    growthTier: tier.id,
+    growthTierLabel: tier.labelKo,
+    growthRatio: state.growthRatio,
+    nextUnlockRatio: next?.thresholdRatio ?? null,
+    nextCollectSize: next
+      ? `${Math.round(next.itemRadiusRangeRatio[0] * 100)}-${Math.round(next.itemRadiusRangeRatio[1] * 100)}%`
+      : "거대 목표",
+    bossName: boss?.name ?? "",
+    bossCollected: !!boss?.collected,
+    score: state.score,
+    combo: state.combo,
+    maxCombo: state.maxCombo,
+    eraScore: state.eraScore,
+    lastCollection: state.lastCollection,
+    blockedCollision: state.blockedCollision,
     bestEra,
     bestSize,
   };
@@ -1709,7 +1912,7 @@ function drawEraEnvironment(
   const pathColor = state.era === 3
     ? mixColor([0.22, 0.34, 0.52], [0.82, 0.94, 1], 0.2)
     : mixColor([0.98, 0.89, 0.68], era.ground, 0.24);
-  const pathCount = state.lowQuality ? 8 : 12;
+  const pathCount = state.lowQuality ? 3 : 12;
   for (let index = 0; index < pathCount; index += 1) {
     const z = -base * (1.55 + index * 1.78);
     const x = Math.sin(index * 0.78 + state.era * 0.44) * base * 1.08;
@@ -1728,7 +1931,9 @@ function drawEraEnvironment(
         const postHeight = isBeacon ? base * 1.72 : base * 0.64;
         const postX = x + edgeX * side * base * 1.18;
         const postZ = z + edgeZ * side * base * 1.18;
-        drawContactShadow(renderer, postX, postZ, base * 0.22, 0.12, yaw);
+        if (!state.lowQuality) {
+          drawContactShadow(renderer, postX, postZ, base * 0.22, 0.12, yaw);
+        }
         renderer.draw(
           state.era === 2 ? "cube" : "cylinder",
           state.era === 0
@@ -1779,7 +1984,7 @@ function drawEraEnvironment(
 
   const branchStart: [number, number] = [base * 1.1, -base * 5.2];
   const branchEnd: [number, number] = [half * 0.29, -half * 0.4];
-  const branchCount = state.lowQuality ? 3 : 6;
+  const branchCount = state.lowQuality ? 1 : 6;
   for (let index = 0; index < branchCount; index += 1) {
     const t = (index + 0.5) / branchCount;
     const nextT = Math.min(1, t + 1 / branchCount);
@@ -1832,11 +2037,11 @@ function drawEraEnvironment(
     [sunX, base * 8.8, sunZ],
     [base * 2.45, base * 2.45, base * 2.45],
     [0, 0, 0],
-    0.96,
+    state.lowQuality ? 1 : 0.96,
     0.82,
   );
 
-  const hillCount = state.lowQuality ? 7 : 13;
+  const hillCount = state.lowQuality ? 2 : 13;
   for (let hillIndex = 0; hillIndex < hillCount; hillIndex += 1) {
     const angle = (hillIndex / hillCount) * Math.PI * 2 + state.era * 0.21;
     const distance = half * mix(1.02, 1.13, (hillIndex % 3) / 2);
@@ -1847,15 +2052,15 @@ function drawEraEnvironment(
       [Math.cos(angle) * distance, hillScale * 0.43, Math.sin(angle) * distance],
       [hillScale * 1.5, hillScale, hillScale * 1.2],
       [0, -angle, 0],
-      0.62,
+      state.lowQuality ? 1 : 0.62,
       0.08,
       { skinTile: groundSkin, textureBlend: 0.18, textureScale: 2.2 },
     );
   }
 
-  const cloudCount = state.lowQuality ? 2 : 4;
+  const cloudCount = state.lowQuality ? 0 : 4;
   for (let cloudIndex = 0; cloudIndex < cloudCount; cloudIndex += 1) {
-    const cloudT = cloudIndex / (cloudCount - 1);
+    const cloudT = cloudCount <= 1 ? 0.55 : cloudIndex / (cloudCount - 1);
     const side = (cloudT - 0.5) * half * 1.02;
     const drift = state.reducedMotion ? 0 : Math.sin(time * 0.09 + cloudIndex * 2.1) * base * 0.7;
     drawCloud(
@@ -1869,7 +2074,7 @@ function drawEraEnvironment(
   }
 
   const random = seededRandom(4400 + state.era * 811);
-  const propCount = state.lowQuality ? 8 : 18;
+  const propCount = state.lowQuality ? 1 : 18;
   for (let index = 0; index < propCount; index += 1) {
     const angle = random() * Math.PI * 2;
     const distance = half * mix(0.46, 0.72, Math.sqrt(random()));
@@ -1880,25 +2085,25 @@ function drawEraEnvironment(
       if (index % 3 !== 0) {
         drawToyTree(renderer, x, z, scale, time, angle);
       } else {
-        drawContactShadow(renderer, x, z, scale * 0.75, 0.13, angle);
+        if (!state.lowQuality) drawContactShadow(renderer, x, z, scale * 0.75, 0.13, angle);
         renderer.draw("sphere", [0.9, 0.65, 0.45], [x, scale * 0.34, z], [scale * 1.1, scale * 0.68, scale * 0.9], [0, angle, 0], 1, 0.12, { skinTile: 2, textureBlend: 0.68, textureScale: 1.4 });
       }
     } else if (state.era === 1) {
-      drawContactShadow(renderer, x, z, scale * 0.82, 0.15, angle);
+      if (!state.lowQuality) drawContactShadow(renderer, x, z, scale * 0.82, 0.15, angle);
       renderer.draw("cube", [1, 0.78, 0.33], [x, scale * 0.34, z], [scale * 1.45, scale * 0.62, scale * 0.92], [0, angle, 0], 1, 0.34, { skinTile: index % 2 === 0 ? 3 : 2, textureBlend: 0.82, textureScale: [1.6, 1] });
       renderer.draw("cone", [1, 0.88, 0.48], [x + Math.cos(angle) * scale * 0.38, scale * 0.82, z + Math.sin(angle) * scale * 0.38], [scale * 0.28, scale * 0.68, scale * 0.28], [0, angle, 0], 1, 0.45, { skinTile: 3, textureBlend: 0.68 });
     } else if (state.era === 2) {
-      drawContactShadow(renderer, x, z, scale * 0.9, 0.15, angle);
+      if (!state.lowQuality) drawContactShadow(renderer, x, z, scale * 0.9, 0.15, angle);
       renderer.draw("cube", [0.72, 0.9, 1], [x, scale * 0.44, z], [scale * 1.7, scale * 0.82, scale], [0, angle, 0], 1, 0.42, { skinTile: 4, textureBlend: 0.88, textureScale: [2, 1] });
-      renderer.draw("cube", [0.94, 0.98, 1], [x, scale * 0.94, z], [scale * 1.1, scale * 0.12, scale * 0.72], [0, angle, 0], 0.9, 0.85, { skinTile: 7, textureBlend: 0.42 });
+      renderer.draw("cube", [0.94, 0.98, 1], [x, scale * 0.94, z], [scale * 1.1, scale * 0.12, scale * 0.72], [0, angle, 0], state.lowQuality ? 1 : 0.9, 0.85, { skinTile: 7, textureBlend: 0.42 });
     } else {
-      drawContactShadow(renderer, x, z, scale * 0.68, 0.15, angle);
+      if (!state.lowQuality) drawContactShadow(renderer, x, z, scale * 0.68, 0.15, angle);
       renderer.draw("cube", [0.48, 0.64, 0.94], [x, scale * 0.72, z], [scale * 0.86, scale * 1.42, scale * 0.72], [0, angle, 0], 1, 0.68, { skinTile: 5, textureBlend: 0.94, textureScale: [1, 1.8] });
-      renderer.draw("sphere", [0.28, 0.9, 1], [x, scale * 1.56, z], [scale * 0.2, scale * 0.2, scale * 0.2], [0, 0, 0], 0.92, 0.96);
+      renderer.draw("sphere", [0.28, 0.9, 1], [x, scale * 1.56, z], [scale * 0.2, scale * 0.2, scale * 0.2], [0, 0, 0], state.lowQuality ? 1 : 0.92, 0.96);
     }
   }
 
-  const landmarkCount = state.lowQuality ? 8 : 13;
+  const landmarkCount = state.lowQuality ? 2 : 13;
   for (let index = 0; index < landmarkCount; index += 1) {
     const angle = (index / landmarkCount) * Math.PI * 2 + (random() - 0.5) * 0.16;
     const distanceBand = [0.78, 0.89, 0.98][index % 3];
@@ -1946,7 +2151,9 @@ function drawEraEnvironment(
   for (const side of [-1, 1]) {
     const crateX = setPieceX + side * base * 1.7;
     const crateZ = setPieceZ + base * 1.15;
-    drawContactShadow(renderer, crateX, crateZ, base * 0.65, 0.16, side * 0.24);
+    if (!state.lowQuality) {
+      drawContactShadow(renderer, crateX, crateZ, base * 0.65, 0.16, side * 0.24);
+    }
     renderer.draw(
       state.era === 0 || state.era === 4 ? "cylinder" : "cube",
       mixColor(focusColor, [1, 0.84, 0.42], 0.28),
@@ -1963,40 +2170,42 @@ function drawEraEnvironment(
     );
   }
 
-  const foregroundAnchors = [
-    [-0.43, -0.27, 1.48, 0.42],
-    [0.48, -0.07, 1.28, -0.92],
-  ] as const;
-  for (const [xRatio, zRatio, scaleRatio, yaw] of foregroundAnchors) {
-    const anchorX = half * xRatio;
-    const anchorZ = half * zRatio;
-    renderer.draw(
-      "cube",
-      mixColor(groundEdge, focusColor, 0.18),
-      [anchorX, base * 0.065, anchorZ],
-      [base * scaleRatio * 2.78, base * 0.13, base * scaleRatio * 2.34],
-      [0, yaw, 0],
-      1,
-      0.14,
-    );
-    renderer.draw(
-      "cube",
-      mixColor(groundCenter, focusColor, 0.22),
-      [anchorX, base * 0.15, anchorZ],
-      [base * scaleRatio * 2.52, base * 0.06, base * scaleRatio * 2.08],
-      [0, yaw, 0],
-      1,
-      0.2,
-    );
-    drawEraLandmark(
-      renderer,
-      state.era,
-      anchorX,
-      anchorZ,
-      base * scaleRatio,
-      yaw,
-      time,
-    );
+  if (!state.lowQuality) {
+    const foregroundAnchors = [
+      [-0.43, -0.27, 1.48, 0.42],
+      [0.48, -0.07, 1.28, -0.92],
+    ] as const;
+    for (const [xRatio, zRatio, scaleRatio, yaw] of foregroundAnchors) {
+      const anchorX = half * xRatio;
+      const anchorZ = half * zRatio;
+      renderer.draw(
+        "cube",
+        mixColor(groundEdge, focusColor, 0.18),
+        [anchorX, base * 0.065, anchorZ],
+        [base * scaleRatio * 2.78, base * 0.13, base * scaleRatio * 2.34],
+        [0, yaw, 0],
+        1,
+        0.14,
+      );
+      renderer.draw(
+        "cube",
+        mixColor(groundCenter, focusColor, 0.22),
+        [anchorX, base * 0.15, anchorZ],
+        [base * scaleRatio * 2.52, base * 0.06, base * scaleRatio * 2.08],
+        [0, yaw, 0],
+        1,
+        0.2,
+      );
+      drawEraLandmark(
+        renderer,
+        state.era,
+        anchorX,
+        anchorZ,
+        base * scaleRatio,
+        yaw,
+        time,
+      );
+    }
   }
 }
 
@@ -2007,6 +2216,8 @@ function drawItem(
   lowQuality: boolean,
   focusTheme: ThemeId,
   camera: CameraState,
+  lod: ItemRenderLod = "full",
+  drawShadow = true,
 ) {
   const theme = THEME_BY_ID[item.theme];
   const isFocus = item.theme === focusTheme;
@@ -2022,7 +2233,37 @@ function drawItem(
     ? Math.sin(time * 1.2) * r * 0.05
     : Math.sin(time * 1.45 + item.id * 0.73) * r * 0.025;
   const y = r * 0.52 + bob;
-  drawContactShadow(renderer, item.x, item.z, r * 0.8, item.special ? 0.26 : 0.2, item.yaw);
+  if (drawShadow) {
+    drawContactShadow(renderer, item.x, item.z, r * 0.8, item.special ? 0.26 : 0.2, item.yaw);
+  }
+
+  if (lod === "simple" && !item.special) {
+    const toCameraX = camera.eye[0] - item.x;
+    const toCameraZ = camera.eye[2] - item.z;
+    const length = Math.hypot(toCameraX, toCameraZ) || 1;
+    const dirX = toCameraX / length;
+    const dirZ = toCameraZ / length;
+    if (isFocus) {
+      renderer.draw(
+        "cylinder",
+        mixColor(theme.color, [1, 0.9, 0.45], 0.18),
+        [item.x, r * 0.026, item.z],
+        [r * 1.28, r * 0.028, r * 1.28],
+        [0, item.yaw, 0],
+        0.28,
+        0.82,
+      );
+    }
+    renderer.drawObjectDecal(
+      item.decalTile,
+      [item.x + dirX * r * 0.24, y + r * 0.28, item.z + dirZ * r * 0.24],
+      r * (isFocus ? 1.26 : 1.05),
+      Math.atan2(dirX, dirZ),
+      lowQuality ? 1 : isFocus ? 0.82 : 0.64,
+    );
+    return;
+  }
+
   renderer.draw(
     "cylinder",
     mixColor(theme.color, [1, 0.9, 0.45], 0.18),
@@ -2067,7 +2308,7 @@ function drawItem(
       [item.x + dirX * r * Math.max(offset, 0.18), y + r * height, item.z + dirZ * r * Math.max(offset, 0.18)],
       r * size * 1.34,
       Math.atan2(dirX, dirZ),
-      item.special ? 0.96 : 0.9,
+      lowQuality ? 1 : item.special ? 0.96 : 0.9,
     );
   };
 
@@ -2343,16 +2584,18 @@ function drawRobot(
   heading: number,
 ) {
   const radius = state.radius;
-  const r = radius * 0.82;
-  const speed01 = clamp(Math.hypot(state.vx, state.vz) / Math.max(radius * 9.2, 0.01), 0, 1);
+  const base = ERAS[state.era].baseRadius;
+  const robotScale = base * 0.26;
+  const r = robotScale;
+  const speed01 = clamp(Math.hypot(state.vx, state.vz) / Math.max(base * 7.2, 0.01), 0, 1);
   const forwardX = Math.sin(heading);
   const forwardZ = -Math.cos(heading);
   const rightX = Math.cos(heading);
   const rightZ = Math.sin(heading);
   const portrait = typeof window !== "undefined" && window.innerHeight > window.innerWidth * 1.12;
   const sideOffset = portrait ? 0.34 : 0.46;
-  const centerX = state.x - forwardX * radius * 1.56 + rightX * radius * sideOffset;
-  const centerZ = state.z - forwardZ * radius * 1.56 + rightZ * radius * sideOffset;
+  const centerX = state.x - forwardX * (radius + robotScale * 1.45) + rightX * robotScale * sideOffset;
+  const centerZ = state.z - forwardZ * (radius + robotScale * 1.45) + rightZ * robotScale * sideOffset;
   const lean = speed01 * 0.14;
   const stride = Math.sin(time * mix(5.2, 9.4, speed01)) * r * mix(0.05, 0.14, speed01);
   const local = (x: number, y: number, z: number): Vec3 => [
@@ -2398,8 +2641,8 @@ function drawRobot(
 
   const leftShoulder = local(-r * 0.48, r * 1.02, r * 0.28);
   const rightShoulder = local(r * 0.48, r * 1.02, r * 0.28);
-  const leftHand = ballContact(-r * 0.34, radius * 0.9);
-  const rightHand = ballContact(r * 0.34, radius * 0.9);
+  const leftHand = ballContact(-r * 0.42, radius * 0.9);
+  const rightHand = ballContact(r * 0.42, radius * 0.9);
   drawLimb(leftShoulder, leftHand, r * 0.15, [1, 0.76, 0.28]);
   drawLimb(rightShoulder, rightHand, r * 0.15, [1, 0.76, 0.28]);
   const handleCenter = ballContact(0, radius * 0.9);
@@ -2432,16 +2675,17 @@ function drawSpeedEffects(
   camera: CameraState,
   time: number,
 ) {
-  if (state.reducedMotion || camera.speed01 < 0.16) return;
+  if (state.lowQuality || state.reducedMotion || camera.speed01 < 0.16) return;
   const r = state.radius;
   const forwardX = Math.sin(camera.heading);
   const forwardZ = -Math.cos(camera.heading);
   const rightX = Math.cos(camera.heading);
   const rightZ = Math.sin(camera.heading);
-  for (let index = 0; index < 6; index += 1) {
+  const streakCount = state.lowQuality ? 2 : 6;
+  for (let index = 0; index < streakCount; index += 1) {
     const distance = r * (1.8 + index * 1.05);
     const side = Math.sin(time * 5 + index * 2.4) * r * (0.3 + index * 0.06);
-    const fade = camera.speed01 * (1 - index / 7) * 0.3;
+    const fade = camera.speed01 * (1 - index / (streakCount + 1)) * 0.3;
     renderer.draw(
       "sphere",
       mixColor([1.0, 0.80, 0.24], ERAS[state.era].sky, index / 8),
@@ -2450,7 +2694,7 @@ function drawSpeedEffects(
         r * mix(0.62, 0.18, index / 6),
         state.z - forwardZ * distance + rightZ * side,
       ],
-      [r * mix(0.55, 0.16, index / 6), r * 0.14, r * mix(0.9, 0.25, index / 6)],
+      [r * mix(0.55, 0.16, index / streakCount), r * 0.14, r * mix(0.9, 0.25, index / streakCount)],
       [0, camera.heading, 0],
       fade,
       0.72,
@@ -2530,6 +2774,70 @@ function drawBall(renderer: WebGlToyRenderer, state: GameState, time: number) {
   });
 }
 
+function visibleCollectibles(
+  state: GameState,
+  camera: CameraState,
+  base: number,
+): VisibleCollectible[] {
+  const forwardX = Math.sin(camera.heading);
+  const forwardZ = -Math.cos(camera.heading);
+  const rightX = Math.cos(camera.heading);
+  const rightZ = Math.sin(camera.heading);
+  const hardBudget = state.lowQuality ? 12 : 42;
+  const candidates: VisibleCollectible[] = [];
+  const required: VisibleCollectible[] = [];
+
+  for (const item of state.items) {
+    if (item.collected) continue;
+    const dx = item.x - state.x;
+    const dz = item.z - state.z;
+    const distance = Math.hypot(dx, dz);
+    const forwardDistance = dx * forwardX + dz * forwardZ;
+    const sideDistance = Math.abs(dx * rightX + dz * rightZ);
+    const near = distance < base * (state.lowQuality ? 3.4 : 8.5);
+    const trailFocus =
+      item.theme === ERAS[state.era].focus &&
+      forwardDistance > -base * 1.8 &&
+      forwardDistance < base * (state.lowQuality ? 7.5 : 30) &&
+      sideDistance < base * (state.lowQuality ? 2.8 : 5.8);
+    const readyTarget = canCollectByRule(state, item, state.bossReady) && distance < base * (state.lowQuality ? 4.2 : 12);
+    const visibleForward =
+      forwardDistance > -base * 5 &&
+      forwardDistance < base * (state.lowQuality ? 24 : 58) &&
+      sideDistance < base * (state.lowQuality ? 9 : 22);
+    const priority =
+      (item.special ? 2000 : 0) +
+      (near ? 900 : 0) +
+      (readyTarget ? 700 : 0) +
+      (trailFocus ? 520 : 0) +
+      (item.theme === ERAS[state.era].focus ? 180 : 0) -
+      distance / Math.max(base, 0.001);
+    const entry: VisibleCollectible = {
+      item,
+      lod: item.special || !state.lowQuality || distance < base * 2.3 ? "full" : "simple",
+      drawShadow: item.special || distance < base * (state.lowQuality ? 3 : 8.5) || (trailFocus && distance < base * 13),
+      priority,
+      distance,
+    };
+
+    if (item.special || near || readyTarget || trailFocus) {
+      required.push(entry);
+    } else if (visibleForward) {
+      candidates.push(entry);
+    }
+  }
+
+  const selected = new Map<number, VisibleCollectible>();
+  for (const entry of required.sort((a, b) => b.priority - a.priority)) {
+    selected.set(entry.item.id, entry);
+  }
+  for (const entry of candidates.sort((a, b) => b.priority - a.priority)) {
+    if (selected.size >= hardBudget) break;
+    selected.set(entry.item.id, entry);
+  }
+  return [...selected.values()].sort((a, b) => b.distance - a.distance);
+}
+
 function drawWorld(
   renderer: WebGlToyRenderer,
   state: GameState,
@@ -2563,17 +2871,44 @@ function drawWorld(
   );
   drawEraEnvironment(renderer, state, camera, visualTime);
 
-  for (const item of state.items) {
-    if (!item.collected) drawItem(renderer, item, visualTime, state.lowQuality, era.focus, renderCamera);
+  const visibleItems = visibleCollectibles(state, camera, base);
+  renderer.recordCulledItem(state.items.filter((item) => !item.collected).length - visibleItems.length);
+  const shadowedItemIds = new Set(
+    state.lowQuality
+      ? visibleItems
+          .filter((entry) => entry.item.special || entry.drawShadow)
+          .sort((a, b) => (a.item.special === b.item.special ? a.distance - b.distance : a.item.special ? -1 : 1))
+          .slice(0, 4)
+          .map((entry) => entry.item.id)
+      : visibleItems.filter((entry) => entry.drawShadow).map((entry) => entry.item.id),
+  );
+  for (const entry of visibleItems) {
+    renderer.recordRenderedItem();
+    drawItem(
+      renderer,
+      entry.item,
+      visualTime,
+      state.lowQuality || entry.lod === "simple",
+      era.focus,
+      renderCamera,
+      entry.lod,
+      entry.drawShadow && shadowedItemIds.has(entry.item.id),
+    );
   }
   for (const particle of state.particles) {
+    const toCameraX = renderCamera.eye[0] - particle.x;
+    const toCameraZ = renderCamera.eye[2] - particle.z;
+    const length = Math.hypot(toCameraX, toCameraZ) || 1;
+    const dirX = toCameraX / length;
+    const dirZ = toCameraZ / length;
+    const size = base * (0.32 + clamp(particle.life, 0, 1) * 0.12);
     renderer.draw(
-      "sphere",
+      "plane",
       particle.color,
       [particle.x, particle.y, particle.z],
-      [base * 0.13, base * 0.13, base * 0.13],
-      [0, 0, 0],
-      clamp(particle.life * 2, 0, 1),
+      [size, size, size],
+      [0, Math.atan2(dirX, dirZ), 0],
+      state.lowQuality ? 1 : clamp(particle.life * 2, 0, 1),
       0.82,
     );
   }
@@ -2584,18 +2919,16 @@ function drawWorld(
 }
 
 function loadProgress() {
-  if (typeof window === "undefined") return { bestEra: 0, bestSize: 0 };
+  if (typeof window === "undefined") {
+    return defaultProgress({ maxEraIndex: ERAS.length - 1 });
+  }
   try {
-    const parsed = JSON.parse(window.localStorage.getItem(SAVE_KEY) || "{}") as {
-      bestEra?: number;
-      bestSize?: number;
-    };
-    return {
-      bestEra: clamp(Math.floor(parsed.bestEra || 0), 0, ERAS.length - 1),
-      bestSize: Math.max(0, Number(parsed.bestSize) || 0),
-    };
+    return parseProgressJson(window.localStorage.getItem(SAVE_KEY), {
+      maxEraIndex: ERAS.length - 1,
+      defaultSoundEnabled: true,
+    });
   } catch {
-    return { bestEra: 0, bestSize: 0 };
+    return defaultProgress({ maxEraIndex: ERAS.length - 1 });
   }
 }
 
@@ -2609,6 +2942,9 @@ export default function TimeRollGame() {
   const soundEnabledRef = useRef(true);
   const audioContextRef = useRef<AudioContext | null>(null);
   const [soundEnabled, setSoundEnabled] = useState(true);
+  const [progressSnapshot, setProgressSnapshot] = useState<TimeRollProgressV2>(
+    () => defaultProgress({ maxEraIndex: ERAS.length - 1 }),
+  );
   const [fullscreen, setFullscreen] = useState(false);
   const [joystickKnob, setJoystickKnob] = useState({ x: 0, y: 0 });
   const initialHud = useMemo<HudSnapshot>(
@@ -2616,7 +2952,7 @@ export default function TimeRollGame() {
       mode: "intro",
       era: 0,
       timer: ERAS[0].seconds,
-      radius: ERAS[0].baseRadius,
+      radius: startingRadius(ERAS[0].baseRadius),
       boost: 1,
       themeTotals: { ...EMPTY_TOTALS },
       eraCollected: 0,
@@ -2625,7 +2961,21 @@ export default function TimeRollGame() {
       message: ERAS[0].mission,
       nearbyName: "",
       nearbyCanCollect: false,
+      bossReady: false,
       finalReady: false,
+      growthTier: getGrowthTier(startingRadius(ERAS[0].baseRadius), ERAS[0].baseRadius).id,
+      growthTierLabel: getGrowthTier(startingRadius(ERAS[0].baseRadius), ERAS[0].baseRadius).labelKo,
+      growthRatio: getGrowthRatio(startingRadius(ERAS[0].baseRadius), ERAS[0].baseRadius),
+      nextUnlockRatio: getNextTier(startingRadius(ERAS[0].baseRadius), ERAS[0].baseRadius)?.thresholdRatio ?? null,
+      nextCollectSize: `${Math.round(GROWTH_TIERS[1].itemRadiusRangeRatio[0] * 100)}-${Math.round(GROWTH_TIERS[1].itemRadiusRangeRatio[1] * 100)}%`,
+      bossName: "거대 물레방아",
+      bossCollected: false,
+      score: 0,
+      combo: 0,
+      maxCombo: 0,
+      eraScore: 0,
+      lastCollection: "",
+      blockedCollision: "",
       bestEra: 0,
       bestSize: 0,
     }),
@@ -2685,9 +3035,16 @@ export default function TimeRollGame() {
     }
 
     const saved = loadProgress();
+    let savedProgress = saved;
     const state = createState(0, reducedMotion, 20260730, lowQuality);
     const camera = createCameraState(state);
     gameRef.current = state;
+    soundEnabledRef.current = saved.soundEnabled;
+    queueMicrotask(() => {
+      if (!active) return;
+      setSoundEnabled(saved.soundEnabled);
+      setProgressSnapshot(saved);
+    });
     let bestEra = saved.bestEra;
     let bestSize = saved.bestSize;
     let running = true;
@@ -2695,14 +3052,40 @@ export default function TimeRollGame() {
     let uiAccumulator = 0;
     let manualUntil = 0;
 
-    const save = () => {
+    const persistProgress = () => {
       bestEra = Math.max(bestEra, state.era);
       bestSize = Math.max(bestSize, state.radius);
+      savedProgress = {
+        ...savedProgress,
+        bestEra,
+        bestSize,
+        soundEnabled: soundEnabledRef.current,
+      };
       try {
-        window.localStorage.setItem(SAVE_KEY, JSON.stringify({ bestEra, bestSize }));
+        window.localStorage.setItem(SAVE_KEY, serializeProgress(savedProgress));
+        setProgressSnapshot(savedProgress);
       } catch {
         // Local progress is optional; gameplay remains available when storage is blocked.
       }
+    };
+
+    const saveEraResult = () => {
+      savedProgress = recordEraResult(
+        savedProgress,
+        {
+          era: state.era,
+          score: state.eraScore,
+          maxCombo: state.maxCombo,
+          rank: rankFor(state.eraScore, state.maxCombo, true),
+          completed: true,
+          size: state.radius,
+          storyEndingSeen: state.era === ERAS.length - 1,
+        },
+        { maxEraIndex: ERAS.length - 1 },
+      );
+      bestEra = savedProgress.bestEra;
+      bestSize = savedProgress.bestSize;
+      persistProgress();
     };
 
     const syncHud = (force = false) => {
@@ -2713,13 +3096,14 @@ export default function TimeRollGame() {
 
     const resetEra = (eraIndex: number, mode: GameMode = "playing") => {
       const era = ERAS[eraIndex];
+      const eraStory = getTimeRollEraStory(era.focus);
       state.era = eraIndex;
       state.mode = mode;
       state.x = 0;
       state.z = 0;
       state.vx = 0;
       state.vz = 0;
-      state.radius = era.baseRadius;
+      state.radius = startingRadius(era.baseRadius);
       state.rollX = 0;
       state.rollZ = 0;
       state.timer = era.seconds;
@@ -2729,10 +3113,17 @@ export default function TimeRollGame() {
       state.particles = [];
       state.eraCollected = 0;
       state.collectedLabel = "";
-      state.message = era.mission;
+      state.message = eraStory?.missionBriefing.join(" ") ?? era.mission;
       state.messageTime = 4.5;
       state.cameraKick = 0;
+      state.bossReady = false;
       state.finalReady = false;
+      state.eraScore = 0;
+      state.combo = 0;
+      state.comboTimer = 0;
+      state.lastCollection = "";
+      state.blockedCollision = "";
+      updateGrowthState(state);
       resetCamera(camera, state);
       syncHud(true);
     };
@@ -2744,8 +3135,14 @@ export default function TimeRollGame() {
       if (item.theme === ERAS[state.era].focus && !item.special) {
         state.eraCollected += 1;
       }
-      const addedVolume = Math.pow(item.r, 3) * (item.special ? 0.55 : 0.7);
-      state.radius = Math.cbrt(Math.pow(state.radius, 3) + addedVolume);
+      state.combo = state.comboTimer > 0 ? state.combo + 1 : 1;
+      state.comboTimer = 2.4;
+      state.maxCombo = Math.max(state.maxCombo, state.combo);
+      const gainedScore = scoreForItem(item, state);
+      state.score += gainedScore;
+      state.eraScore += gainedScore;
+      state.radius = absorbRadius(state, item, collectionMultiplier(item, ERAS[state.era].focus));
+      updateGrowthState(state);
       state.attachments.push({
         theme: item.theme,
         seed: item.id * 997 + state.era * 101,
@@ -2754,13 +3151,16 @@ export default function TimeRollGame() {
         decalTile: item.decalTile,
       });
       state.collectedLabel = `${THEME_BY_ID[item.theme].label} · ${item.name}`;
+      state.lastCollection = `${item.name} +${gainedScore}`;
+      state.blockedCollision = "";
       state.message = `${item.name} 모았어요!`;
       state.messageTime = 1.6;
       state.shake = state.reducedMotion ? 0 : item.special ? 0.9 : 0.35;
       state.cameraKick = Math.max(state.cameraKick, item.special ? 1 : 0.42);
       if (!state.reducedMotion) {
         const random = seededRandom(item.id * 311 + state.totalCollected * 47);
-        for (let index = 0; index < 10; index += 1) {
+        const particleCount = state.lowQuality ? 3 : 10;
+        for (let index = 0; index < particleCount; index += 1) {
           state.particles.push({
             x: item.x,
             y: state.radius * 0.9,
@@ -2776,28 +3176,29 @@ export default function TimeRollGame() {
       playTone(430 + state.era * 45, item.special ? 0.3 : 0.11, item.special ? 420 : 130);
 
       const era = ERAS[state.era];
-      if (state.eraCollected >= era.goal) {
+      if (state.eraCollected >= era.goal && !state.bossReady) {
+        const eraStory = getTimeRollEraStory(era.focus);
+        state.bossReady = true;
+        state.finalReady = true;
+        state.message = `${eraStory?.bossLabel ?? "거대 목표"} 해금! 충분히 커져서 코어를 모아요.`;
+        state.messageTime = 5;
+      }
+      if (item.special) {
+        const eraStory = getTimeRollEraStory(era.focus);
         if (state.era === ERAS.length - 1) {
-          state.finalReady = true;
-          if (!item.special) {
-            state.message = "마지막 목표! 앞의 미래 생태돔을 모아 보세요.";
-            state.messageTime = 5;
-          }
+          state.mode = "victory";
+          state.message = TIME_ROLL_ENDING.title;
+          state.messageTime = 20;
+          bestEra = ERAS.length - 1;
+          saveEraResult();
+          playTone(660, 0.5, 520);
         } else {
           state.mode = "eraClear";
-          state.message = `${era.name} 완성!`;
+          state.message = eraStory?.clearTitle ?? `${era.name} 완성!`;
           state.messageTime = 10;
-          save();
+          saveEraResult();
           playTone(620, 0.36, 380);
         }
-      }
-      if (item.special && state.era === ERAS.length - 1 && state.finalReady) {
-        state.mode = "victory";
-        state.message = "시간 전시관 완성!";
-        state.messageTime = 20;
-        bestEra = ERAS.length - 1;
-        save();
-        playTone(660, 0.5, 520);
       }
       syncHud(true);
     };
@@ -2806,6 +3207,8 @@ export default function TimeRollGame() {
       const safeDt = clamp(dt, 0, 1 / 20);
       state.messageTime = Math.max(0, state.messageTime - safeDt);
       state.bumpCooldown = Math.max(0, state.bumpCooldown - safeDt);
+      state.comboTimer = Math.max(0, state.comboTimer - safeDt);
+      if (state.comboTimer === 0) state.combo = 0;
       state.shake = Math.max(0, state.shake - safeDt * 2.5);
       state.cameraKick = Math.max(0, state.cameraKick - safeDt * 2.2);
       for (const particle of state.particles) {
@@ -2857,7 +3260,9 @@ export default function TimeRollGame() {
         state.boost = Math.min(1, state.boost + safeDt * 0.16);
       }
       const braking = keys.has("Space");
-      const topSpeed = state.radius * (boosting ? 9.2 : 5.8);
+      const base = ERAS[state.era].baseRadius;
+      const movementScale = base * mix(1.75, 4.9, clamp(state.growthRatio, 0.18, 1.15));
+      const topSpeed = movementScale * (boosting ? 1.55 : 1);
       const response = braking ? 0.18 : 1 - Math.pow(0.0015, safeDt);
       const targetVx = braking ? 0 : inputX * topSpeed;
       const targetVz = braking ? 0 : inputZ * topSpeed;
@@ -2887,9 +3292,7 @@ export default function TimeRollGame() {
         const distance = Math.hypot(dx, dz);
         const collisionDistance = state.radius + item.r * 0.58;
         if (distance >= collisionDistance) continue;
-        const specialLocked =
-          item.special && state.era === ERAS.length - 1 && !state.finalReady;
-        if (item.r <= state.radius * 0.82 && !specialLocked) {
+        if (canCollectByRule(state, item, state.bossReady)) {
           collect(item);
           if (state.mode !== "playing") break;
         } else if (state.bumpCooldown <= 0) {
@@ -2900,9 +3303,11 @@ export default function TimeRollGame() {
           state.z -= normalZ * overlap * 0.52;
           state.vx *= -0.16;
           state.vz *= -0.16;
-          state.message = specialLocked
-            ? `${ERAS[state.era].goal - state.eraCollected}개 더 모으면 생태돔을 모을 수 있어요`
-            : `${item.name}은 아직 커요. 작은 물건부터 모아 봐요!`;
+          const neededRadius = requiredPlayerRadius(item);
+          state.blockedCollision = item.name;
+          state.message = item.special && !state.bossReady
+            ? `${Math.max(0, ERAS[state.era].goal - state.eraCollected)}개 더 모으면 거대 목표를 열 수 있어요`
+            : `${item.name}은 아직 커요. ${formatSize(neededRadius, state.era)}까지 키워요!`;
           state.messageTime = 2.2;
           state.bumpCooldown = 0.75;
           state.shake = state.reducedMotion ? 0 : 0.25;
@@ -2915,7 +3320,7 @@ export default function TimeRollGame() {
         state.mode = "timeUp";
         state.message = "조금만 더 굴려볼까요?";
         state.messageTime = 20;
-        save();
+        persistProgress();
         playTone(280, 0.22, -100);
       }
       updateCamera(camera, state, safeDt);
@@ -2927,21 +3332,23 @@ export default function TimeRollGame() {
       const nearby = state.items
         .filter((item) => !item.collected)
         .map((item) => ({
+          id: item.id,
           name: item.name,
           theme: THEME_BY_ID[item.theme].label,
           x: Number(item.x.toFixed(2)),
           z: Number(item.z.toFixed(2)),
           size: Number(item.r.toFixed(2)),
+          requiredRadius: Number(requiredPlayerRadius(item).toFixed(2)),
           objectKind: item.objectKind,
           decalTile: item.decalTile,
           distance: Number(Math.hypot(item.x - state.x, item.z - state.z).toFixed(2)),
-          collectible:
-            item.r <= state.radius * 0.82 &&
-            (!item.special || state.era < ERAS.length - 1 || state.finalReady),
+          collectible: canCollectByRule(state, item, state.bossReady),
           special: !!item.special,
         }))
         .sort((a, b) => a.distance - b.distance)
         .slice(0, 10);
+      const boss = state.items.find((item) => item.special);
+      const renderStats = renderer.getRenderStats();
       return JSON.stringify({
         coordinateSystem: "ground plane x/z; x increases right, z decreases forward; y is up",
         mode: state.mode,
@@ -2956,8 +3363,15 @@ export default function TimeRollGame() {
           z: Number(state.z.toFixed(2)),
           radius: Number(state.radius.toFixed(2)),
           sizeLabel: formatSize(state.radius, state.era),
+          growthRatio: Number(state.growthRatio.toFixed(3)),
+          growthTier: state.growthTier,
+          nextUnlockRatio: state.nextUnlockRatio,
           velocity: { x: Number(state.vx.toFixed(2)), z: Number(state.vz.toFixed(2)) },
         },
+        score: state.score,
+        combo: state.combo,
+        maxCombo: state.maxCombo,
+        eraScore: state.eraScore,
         timerSeconds: Number(state.timer.toFixed(1)),
         boost: Number(state.boost.toFixed(2)),
         reducedMotion: state.reducedMotion,
@@ -2982,11 +3396,31 @@ export default function TimeRollGame() {
           eye: camera.eye.map((value) => Number(value.toFixed(2))),
           target: camera.target.map((value) => Number(value.toFixed(2))),
         },
+        renderStats: {
+          drawCalls: renderStats.drawCalls,
+          triangles: Math.round(renderStats.triangles),
+          transparentCalls: renderStats.transparentCalls,
+          culledItems: renderStats.culledItems,
+          renderedItems: renderStats.renderedItems,
+          frameMsP95: Number(renderStats.frameMsP95.toFixed(2)),
+        },
         goal: {
           collected: state.eraCollected,
           required: ERAS[state.era].goal,
+          bossReady: state.bossReady,
+          bossTarget: boss
+            ? {
+                id: boss.id,
+                name: boss.name,
+                collected: boss.collected,
+                requiredRadius: Number(requiredPlayerRadius(boss).toFixed(2)),
+                collectible: canCollectByRule(state, boss, state.bossReady),
+              }
+            : null,
           finalReady: state.finalReady,
         },
+        blockedCollision: state.blockedCollision,
+        lastCollection: state.lastCollection,
         totals: state.themeTotals,
         nearby,
       });
@@ -3015,7 +3449,7 @@ export default function TimeRollGame() {
         const next = Math.min(state.era + 1, ERAS.length - 1);
         bestEra = Math.max(bestEra, next);
         resetEra(next, "playing");
-        save();
+        persistProgress();
         playTone(520, 0.22, 280);
       },
       retryEra: () => {
@@ -3025,6 +3459,10 @@ export default function TimeRollGame() {
       restart: () => {
         state.themeTotals = { ...EMPTY_TOTALS };
         state.totalCollected = 0;
+        state.score = 0;
+        state.maxCombo = 0;
+        state.combo = 0;
+        state.comboTimer = 0;
         resetEra(0, "playing");
         playTone(420, 0.14, 180);
       },
@@ -3035,17 +3473,40 @@ export default function TimeRollGame() {
 
     const completeEraForTest = () => {
       const era = ERAS[state.era];
+      state.mode = "playing";
       state.eraCollected = era.goal;
-      if (state.era === ERAS.length - 1) {
-        state.finalReady = true;
-        state.message = "마지막 목표! 미래 생태돔을 모아 보세요.";
-        state.messageTime = 5;
-      } else {
-        state.mode = "eraClear";
-        state.message = `${era.name} 완성!`;
-        state.messageTime = 10;
+      state.bossReady = true;
+      state.finalReady = true;
+      state.radius = Math.max(state.radius, requiredPlayerRadius({ r: era.baseRadius * BOSS_RADIUS_RATIO }) * 1.03);
+      updateGrowthState(state);
+      const boss = state.items.find((item) => item.special && !item.collected);
+      if (boss) {
+        state.x = boss.x;
+        state.z = boss.z;
+        collect(boss);
       }
       syncHud(true);
+    };
+
+    const collectItemForTest = (id: number) => {
+      const item = state.items.find((entry) => entry.id === id);
+      if (!item || item.collected) return false;
+      if (!canCollectByRule(state, item, state.bossReady)) return false;
+      collect(item);
+      syncHud(true);
+      return true;
+    };
+
+    const warpToItemForTest = (id: number) => {
+      const item = state.items.find((entry) => entry.id === id && !entry.collected);
+      if (!item) return false;
+      state.x = item.x;
+      state.z = item.z;
+      state.vx = 0;
+      state.vz = 0;
+      updateCamera(camera, state, 1 / 60);
+      syncHud(true);
+      return true;
     };
 
     window.render_game_to_text = getTextState;
@@ -3062,6 +3523,24 @@ export default function TimeRollGame() {
     if (exposeTestControls) {
       window.__timeRollTest = {
         start: () => actionsRef.current?.start(0),
+        startEra: (index: number) => {
+          bestEra = Math.max(bestEra, clamp(Math.floor(index), 0, ERAS.length - 1));
+          resetEra(clamp(Math.floor(index), 0, ERAS.length - 1), "playing");
+        },
+        setRadiusRatio: (ratio: number) => {
+          const era = ERAS[state.era];
+          state.radius = Math.max(startingRadius(era.baseRadius), era.baseRadius * Math.max(0, Number(ratio) || 0));
+          updateGrowthState(state);
+          syncHud(true);
+        },
+        collectItem: collectItemForTest,
+        warpToItem: warpToItemForTest,
+        unlockBoss: () => {
+          state.eraCollected = ERAS[state.era].goal;
+          state.bossReady = true;
+          updateGrowthState(state);
+          syncHud(true);
+        },
         completeEra: completeEraForTest,
         nextEra: () => actionsRef.current?.nextEra(),
         retry: () => actionsRef.current?.retryEra(),
@@ -3146,7 +3625,9 @@ export default function TimeRollGame() {
   }, [playTone]);
 
   const era = ERAS[hud.era];
+  const eraStory = TIME_ROLL_ERA_STORIES[hud.era];
   const progress = clamp(hud.eraCollected / era.goal, 0, 1);
+  const cappedEraCollected = Math.min(hud.eraCollected, era.goal);
   const timerProgress = clamp(hud.timer / era.seconds, 0, 1);
 
   const toggleFullscreen = useCallback(() => {
@@ -3155,6 +3636,22 @@ export default function TimeRollGame() {
     } else {
       document.exitFullscreen?.().catch(() => undefined);
     }
+  }, []);
+
+  const toggleSound = useCallback(() => {
+    setSoundEnabled((enabled) => {
+      const next = !enabled;
+      soundEnabledRef.current = next;
+      try {
+        const current = loadProgress();
+        const updated = { ...current, soundEnabled: next };
+        window.localStorage.setItem(SAVE_KEY, serializeProgress(updated));
+        setProgressSnapshot(updated);
+      } catch {
+        // Sound remains usable even when local storage is unavailable.
+      }
+      return next;
+    });
   }, []);
 
   const updateJoystickFromPointer = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
@@ -3220,10 +3717,10 @@ export default function TimeRollGame() {
             <span>{era.year}</span>
           </div>
 
-          <div className="mission-progress" aria-label={`${era.mission} ${hud.eraCollected}/${era.goal}`}>
+          <div className="mission-progress" aria-label={`${era.mission} ${cappedEraCollected}/${era.goal}`}>
             <div className="mission-row">
               <span>{THEME_BY_ID[era.focus].icon} {THEME_BY_ID[era.focus].label} 미션</span>
-              <strong>{hud.eraCollected} / {era.goal}</strong>
+              <strong>{cappedEraCollected} / {era.goal}</strong>
             </div>
             <div className="progress-track">
               <span style={{ width: `${progress * 100}%`, backgroundColor: `rgb(${THEME_BY_ID[era.focus].color.map((v) => Math.round(v * 255)).join(",")})` }} />
@@ -3239,6 +3736,27 @@ export default function TimeRollGame() {
         <div className="timer-bar" aria-label={`남은 시간 ${Math.ceil(hud.timer)}초`}>
           <span style={{ width: `${timerProgress * 100}%` }} />
           <b>{Math.ceil(hud.timer)}초</b>
+        </div>
+
+        <div className="growth-panel" aria-label={`성장 단계 ${hud.growthTierLabel}`}>
+          <div className="growth-row">
+            <span>성장 단계</span>
+            <strong>{hud.growthTierLabel}</strong>
+            <em>{Math.round(hud.growthRatio * 100)}%</em>
+          </div>
+          <div className="growth-track">
+            <span style={{ width: `${clamp(hud.growthRatio / BOSS_RADIUS_RATIO, 0, 1) * 100}%` }} />
+          </div>
+          <div className="growth-meta">
+            <span>다음 수집 크기 {hud.nextCollectSize}</span>
+            <b>{hud.bossReady ? `${hud.bossName} 수집 가능` : `${Math.max(0, era.goal - hud.eraCollected)}개 후 거대 목표`}</b>
+          </div>
+        </div>
+
+        <div className="score-strip" aria-label={`점수 ${hud.score}점 콤보 ${hud.combo}`}>
+          <span>점수 <strong>{hud.score.toLocaleString("ko-KR")}</strong></span>
+          <span>콤보 <strong>{hud.combo}</strong></span>
+          <span>시대 점수 <strong>{hud.eraScore.toLocaleString("ko-KR")}</strong></span>
         </div>
 
         <div className="theme-strip" aria-label="주제별 수집 수">
@@ -3259,7 +3777,7 @@ export default function TimeRollGame() {
             type="button"
             className="icon-button"
             aria-label={soundEnabled ? "소리 끄기" : "소리 켜기"}
-            onClick={() => setSoundEnabled((enabled) => !enabled)}
+            onClick={toggleSound}
           >
             {soundEnabled ? "♪" : "×♪"}
           </button>
@@ -3341,48 +3859,74 @@ export default function TimeRollGame() {
 
       {hud.mode === "intro" ? (
         <section className="game-overlay intro-overlay" aria-labelledby="game-title">
-          <div className="intro-panel">
-            <div className="brand-mark" aria-hidden="true">
-              <span className="brand-orbit orbit-one" />
-              <span className="brand-orbit orbit-two" />
-              <i>⚙</i>
-            </div>
-            <p className="eyebrow">5개의 시대 · 5개의 주제 · 하나의 커다란 모험</p>
-            <h1 id="game-title">
-              데굴데굴
-              <span>시간공작소</span>
+          {/* vinext serves this static key art directly; its Next image optimizer is not available in the worker runtime. */}
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            className="intro-keyart"
+            src="/time-roll-key-art.jpg"
+            alt=""
+          />
+          <div className="title-stage">
+            <p className="title-kicker">{TIME_ROLL_INTRO_TEASER.kicker}</p>
+            <h1 id="game-title" className="title-logo">
+              {TIME_ROLL_INTRO_TEASER.title.map((line) => <span key={line}>{line}</span>)}
             </h1>
-            <p className="intro-copy">
-              시간정비 로봇 <strong>토리</strong>와 함께 시간 구슬을 굴려 보세요.
-              작은 손도구부터 미래의 거대한 생태돔까지 차곡차곡 모을 수 있어요.
+            <p className="title-tagline">
+              {TIME_ROLL_INTRO_TEASER.tagline} 미래 도시의 시간동력핵을 되살리기 위해
+              {" "}{TIME_ROLL_PROTAGONIST.name}가 다섯 시대의 기술 코어를 모아요.
             </p>
-            <div className="intro-themes" aria-label="게임 주제">
-              {THEMES.map((theme) => (
-                <span key={theme.id}>
-                  <i style={{ backgroundColor: `rgb(${theme.color.map((v) => Math.round(v * 255)).join(",")})` }}>{theme.icon}</i>
-                  {theme.label}
-                </span>
+            <div className="scale-promise" aria-label="성장 크기 흐름">
+              {["손안 물건", "책상 위 물건", "교실 물건", "건물만 한 물건", "시대 상징물"].map((label, index) => (
+                <Fragment key={label}>
+                  <span className="scale-step">{label}</span>
+                  {index < 4 ? <i className="scale-arrow" aria-hidden="true">→</i> : null}
+                </Fragment>
               ))}
             </div>
-            <button
-              id="start-btn"
-              type="button"
-              className="primary-button"
-              onClick={() => actionsRef.current?.start(0)}
-            >
-              <span>시간 구슬 굴리기</span>
-              <b>→</b>
-            </button>
-            <p className="start-tip">방향키 또는 화면 조이스틱 하나면 충분해요</p>
+            <div className="launch-actions">
+              <button
+                id="start-btn"
+                type="button"
+                className="primary-button launch-button"
+                onClick={() => actionsRef.current?.start(hud.bestEra > 0 ? hud.bestEra : 0)}
+              >
+                <span>{hud.bestEra > 0 ? "이어서 굴리기" : "처음 시작"}</span>
+                <b>→</b>
+              </button>
+              {hud.bestEra > 0 ? (
+                <button type="button" className="resume-button" onClick={() => actionsRef.current?.start(0)}>
+                  처음부터
+                </button>
+              ) : null}
+            </div>
+            <p className="title-tip">{TIME_ROLL_INTRO_TEASER.tip}</p>
           </div>
-          <div className="timeline-preview" aria-label="시대 여행 순서">
-            {ERAS.map((entry, index) => (
-              <div key={entry.shortName}>
-                <span>{index + 1}</span>
-                <b>{entry.shortName}</b>
-                <small>{THEME_BY_ID[entry.focus].label}</small>
-              </div>
-            ))}
+          <div className="era-rail" aria-label="시대 선택">
+            {ERAS.map((entry, index) => {
+              const record = progressSnapshot.eras[String(index)];
+              return (
+                <button
+                  type="button"
+                  className={`era-node ${index === hud.era ? "is-current" : ""} ${index <= hud.bestEra ? "is-unlocked" : "is-locked"}`}
+                  key={entry.shortName}
+                  onClick={() => actionsRef.current?.start(index)}
+                  disabled={index > hud.bestEra}
+                  aria-current={index === hud.era ? "step" : undefined}
+                >
+                  <span className="era-dot">{index + 1}</span>
+                  <span className="era-copy">
+                    <b>{entry.shortName}</b>
+                    <small>
+                      {THEME_BY_ID[entry.focus].label}
+                      {record?.completed ? ` · ${record.bestRank}랭크` : ""}
+                    </small>
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+          <div className="intro-utility" aria-hidden="true">
+            {formatSize(startingRadius(ERAS[0].baseRadius), 0)} 시작 · 누적 최고 {progressSnapshot.totalScore.toLocaleString("ko-KR")}점
           </div>
         </section>
       ) : null}
@@ -3407,11 +3951,11 @@ export default function TimeRollGame() {
         <section className="game-overlay compact-overlay" aria-labelledby="clear-title">
           <div className="result-panel success-panel">
             <div className="result-badge">{THEME_BY_ID[era.focus].icon}</div>
-            <p className="eyebrow">시대 {hud.era + 1} 완성</p>
-            <h2 id="clear-title">{era.name}</h2>
+            <p className="eyebrow">{eraStory.clearTitle}</p>
+            <h2 id="clear-title">{eraStory.eraName}</h2>
             <p>
-              {THEME_BY_ID[era.focus].label} 물건 {hud.eraCollected}개를 모았어요.
-              다음 시대에는 물건과 시간 구슬이 훨씬 커져요!
+              {eraStory.clearLines.join(" ")} 거대 코어 <strong>{hud.bossName}</strong> 수집 완료.
+              시대 점수 {hud.eraScore.toLocaleString("ko-KR")}점 · 최고 콤보 {hud.maxCombo} · 랭크 {rankFor(hud.eraScore, hud.maxCombo, hud.bossCollected)}
             </p>
             <button type="button" className="primary-button" onClick={() => actionsRef.current?.nextEra()}>
               <span>다음 시대로</span><b>→</b>
@@ -3440,11 +3984,15 @@ export default function TimeRollGame() {
         <section className="game-overlay victory-overlay" aria-labelledby="victory-title">
           <div className="result-panel victory-panel">
             <div className="victory-sparkles" aria-hidden="true">✦ · ✧ · ✦</div>
-            <p className="eyebrow">다섯 시대 여행 성공</p>
-            <h2 id="victory-title">시간 전시관 완성!</h2>
+            <p className="eyebrow">{TIME_ROLL_ENDING.eyebrow}</p>
+            <h2 id="victory-title">{TIME_ROLL_ENDING.title}</h2>
             <p>
-              제조에서 생명까지, 기술은 서로 이어지며 더 나은 미래를 만들어요.
-              토리와 시간 구슬의 가장 큰 기록은 <strong>{formatSize(hud.radius, hud.era)}</strong>예요.
+              {TIME_ROLL_ENDING.lines.join(" ")}
+              {" "}{TIME_ROLL_PROTAGONIST.name}와 시간 구슬의 가장 큰 기록은
+              {" "}<strong>{formatSize(hud.radius, hud.era)}</strong>예요.
+            </p>
+            <p>
+              거대 목표 <strong>{hud.bossName}</strong> 수집 · 시대 점수 {hud.eraScore.toLocaleString("ko-KR")}점 · 최고 콤보 {hud.maxCombo} · 랭크 {rankFor(hud.eraScore, hud.maxCombo, hud.bossCollected)}
             </p>
             <div className="victory-totals">
               {THEMES.map((theme) => (

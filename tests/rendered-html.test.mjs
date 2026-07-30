@@ -38,7 +38,9 @@ test("server-renders the finished Korean game shell", async () => {
   assert.match(html, /<title>데굴데굴 시간공작소 \| 3D 시대 수집 게임<\/title>/i);
   assert.match(html, /데굴데굴/);
   assert.match(html, /시간공작소/);
-  assert.match(html, /시간 구슬 굴리기/);
+  assert.match(html, /로봇 토리/);
+  assert.match(html, /시간동력핵/);
+  assert.match(html, /처음 시작/);
   assert.match(html, /제조/);
   assert.match(html, /건설/);
   assert.match(html, /수송/);
