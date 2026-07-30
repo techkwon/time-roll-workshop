@@ -1598,6 +1598,53 @@ function shapeForTheme(theme: ThemeId): MeshName {
   return "sphere";
 }
 
+function pathBaseSkin(eraIndex: number, groundSkin: number) {
+  if (eraIndex === 0) return 8;
+  if (eraIndex === 4) return 7;
+  return groundSkin;
+}
+
+function pathSegmentSkin(index: number, eraIndex: number, focusTheme: ThemeId, groundSkin: number) {
+  const segmentPhase = index % 4;
+  if (segmentPhase === 1) return SKIN_BY_THEME[focusTheme];
+  if (segmentPhase === 3) {
+    return eraIndex === 0 ? 11 : groundSkin;
+  }
+  return pathBaseSkin(eraIndex, groundSkin);
+}
+
+function pathSegmentMix(index: number, focusColor: [number, number, number], groundEdge: [number, number, number]) {
+  const colorPhase = index % 3;
+  if (colorPhase === 0) return { color: focusColor, amount: 0.16 };
+  if (colorPhase === 1) return { color: [1, 0.94, 0.7] as [number, number, number], amount: 0.1 };
+  return { color: groundEdge, amount: 0.08 };
+}
+
+function clusterMeshForEra(eraIndex: number, index: number): MeshName {
+  if (eraIndex === 0) return index % 2 === 0 ? "kenneyCog" : "kenneyConveyor";
+  if (eraIndex === 1) return "truss";
+  if (eraIndex === 2) return "kenneyCarCone";
+  if (eraIndex === 3) return "dish";
+  return index % 2 === 0 ? "kenneyTreeOak" : "kenneyMushroomRed";
+}
+
+function detailShapeForIndex(index: number): MeshName {
+  if (index % 5 === 0) return "cone";
+  if (index % 3 === 0) return "sphere";
+  if (index % 2 === 0) return "cube";
+  return "cylinder";
+}
+
+function simpleItemShape(imageFamily: number, theme: ThemeId, fallbackShape: MeshName): MeshName {
+  if (imageFamily === 0) return "capsule";
+  if (imageFamily === 1) return "roundedBox";
+  if (imageFamily === 2) return "cone";
+  if (imageFamily === 3) {
+    return theme === "transport" ? "wheel" : "dish";
+  }
+  return fallbackShape;
+}
+
 function objectKindFor(theme: ThemeId, sequence: number) {
   return (sequence + THEME_INDEX[theme] * 3) % OBJECT_VARIANTS_PER_THEME;
 }
@@ -2561,40 +2608,25 @@ function drawEraEnvironment(
       );
     });
   }
-  const pathSkin = state.era === 0 ? 8 : state.era === 4 ? 7 : groundSkin;
   const pathColor = state.era === 3
     ? mixColor([0.22, 0.34, 0.52], [0.82, 0.94, 1], 0.2)
     : mixColor([0.98, 0.89, 0.68], era.ground, 0.24);
+  const pathSkin = pathBaseSkin(state.era, groundSkin);
   const pathCount = state.lowQuality ? 3 : 9;
   for (let index = 0; index < pathCount; index += 1) {
     const z = -base * (1.55 + index * 2.16);
     const x = Math.sin(index * 0.78 + state.era * 0.44) * base * 1.08;
     const nextX = Math.sin((index + 1) * 0.78 + state.era * 0.44) * base * 1.08;
     const yaw = Math.atan2(nextX - x, -base * 2.16);
-    const segmentSkin = index % 4 === 1
-      ? SKIN_BY_THEME[era.focus]
-      : index % 4 === 3
-        ? (state.era === 0 ? 11 : groundSkin)
-        : pathSkin;
-    const segmentColor = mixColor(
-      pathColor,
-      index % 3 === 0 ? focusColor : index % 3 === 1 ? [1, 0.94, 0.7] : groundEdge,
-      index % 3 === 0 ? 0.16 : index % 3 === 1 ? 0.1 : 0.08,
-    );
+    const segmentSkin = pathSegmentSkin(index, state.era, era.focus, groundSkin);
+    const segmentMix = pathSegmentMix(index, focusColor, groundEdge);
+    const segmentColor = mixColor(pathColor, segmentMix.color, segmentMix.amount);
     drawPathTile(renderer, x, z, base * 1.52, base * 2.28, yaw, segmentSkin, segmentColor);
     if (!state.lowQuality && index % 3 === 1) {
       const clusterSide = index % 2 === 0 ? -1 : 1;
       const cluster = rotateGroundPoint(x, z, yaw, clusterSide * base * 1.28, base * 0.08);
       drawContactShadow(renderer, cluster[0], cluster[1], base * 0.42, 0.14, yaw);
-      const clusterMesh: MeshName = state.era === 0
-        ? (index % 2 === 0 ? "kenneyCog" : "kenneyConveyor")
-        : state.era === 1
-          ? "truss"
-          : state.era === 2
-            ? "kenneyCarCone"
-            : state.era === 3
-              ? "dish"
-              : index % 2 === 0 ? "kenneyTreeOak" : "kenneyMushroomRed";
+      const clusterMesh = clusterMeshForEra(state.era, index);
       renderer.draw(
         clusterMesh,
         mixColor(focusColor, [1, 0.9, 0.42], 0.18),
@@ -2818,8 +2850,7 @@ function drawEraEnvironment(
       const detailZ = -base * 2.8 - detailRandom() * half * 0.66;
       if (Math.hypot(detailX, detailZ) < base * 4.2) continue;
       const detailSize = base * mix(0.09, 0.22, detailRandom());
-      const detailShape: MeshName =
-        index % 5 === 0 ? "cone" : index % 3 === 0 ? "sphere" : index % 2 === 0 ? "cube" : "cylinder";
+      const detailShape = detailShapeForIndex(index);
       renderer.draw(
         detailShape,
         mixColor(focusColor, groundEdge, 0.42 + (index % 3) * 0.09),
@@ -3023,16 +3054,7 @@ function drawItem(
   }
 
   if (lod === "simple" && !item.special) {
-    const simpleShape: MeshName =
-      imageFamily === 0
-        ? "capsule"
-        : imageFamily === 1
-          ? "roundedBox"
-          : imageFamily === 2
-            ? "cone"
-            : imageFamily === 3
-              ? item.theme === "transport" ? "wheel" : "dish"
-              : item.shape;
+    const simpleShape = simpleItemShape(imageFamily, item.theme, item.shape);
     if (isFocus && !lowQuality) {
       renderer.draw(
         "cylinder",
@@ -3739,15 +3761,20 @@ function drawWorld(
 
   const visibleItems = visibleCollectibles(state, camera, base);
   renderer.recordCulledItem(state.items.filter((item) => !item.collected).length - visibleItems.length);
-  const shadowedItemIds = new Set(
-    state.lowQuality
-      ? visibleItems
-          .filter((entry) => entry.item.special || entry.drawShadow)
-          .sort((a, b) => (a.item.special === b.item.special ? a.distance - b.distance : a.item.special ? -1 : 1))
-          .slice(0, 4)
-          .map((entry) => entry.item.id)
-      : visibleItems.filter((entry) => entry.drawShadow).map((entry) => entry.item.id),
-  );
+  let shadowedItemIds: Set<number>;
+  if (state.lowQuality) {
+    const lowQualityShadowIds = visibleItems
+      .filter((entry) => entry.item.special || entry.drawShadow)
+      .sort((a, b) => {
+        if (a.item.special === b.item.special) return a.distance - b.distance;
+        return a.item.special ? -1 : 1;
+      })
+      .slice(0, 4)
+      .map((entry) => entry.item.id);
+    shadowedItemIds = new Set(lowQualityShadowIds);
+  } else {
+    shadowedItemIds = new Set(visibleItems.filter((entry) => entry.drawShadow).map((entry) => entry.item.id));
+  }
   for (const entry of visibleItems) {
     renderer.recordRenderedItem();
     drawItem(

@@ -74,4 +74,3 @@ export const KENNEY_FACTORY_MESHES = {
   kenneyNatureTreeOak,
   kenneyNatureMushroomRed,
 } as const;
-

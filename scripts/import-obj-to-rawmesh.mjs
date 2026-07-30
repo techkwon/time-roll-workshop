@@ -216,7 +216,6 @@ for (const name of exportedNames) {
   chunks.push(`  ${name},`);
 }
 chunks.push("} as const;");
-chunks.push("");
 
 await mkdir(path.dirname(outputFile), { recursive: true });
 await writeFile(outputFile, `${chunks.join("\n")}\n`);
