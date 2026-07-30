@@ -81,8 +81,10 @@ type GameState = {
   messageTime: number;
   bumpCooldown: number;
   shake: number;
+  cameraKick: number;
   seed: number;
   reducedMotion: boolean;
+  lowQuality: boolean;
   finalReady: boolean;
 };
 
@@ -115,6 +117,18 @@ type GameActions = {
 
 type Vec3 = [number, number, number];
 type Mat4 = Float32Array;
+
+type CameraState = {
+  eye: Vec3;
+  target: Vec3;
+  up: Vec3;
+  heading: number;
+  bank: number;
+  fov: number;
+  speed01: number;
+  previousVx: number;
+  previousVz: number;
+};
 
 declare global {
   interface Window {
@@ -266,6 +280,14 @@ function mix(a: number, b: number, t: number) {
   return a + (b - a) * t;
 }
 
+function mixColor(a: Vec3, b: Vec3, t: number): Vec3 {
+  return [mix(a[0], b[0], t), mix(a[1], b[1], t), mix(a[2], b[2], t)];
+}
+
+function wrapAngle(angle: number) {
+  return Math.atan2(Math.sin(angle), Math.cos(angle));
+}
+
 function seededRandom(seed: number) {
   let value = seed >>> 0;
   return () => {
@@ -288,6 +310,102 @@ function vecCross([ax, ay, az]: Vec3, [bx, by, bz]: Vec3): Vec3 {
 
 function vecDot([ax, ay, az]: Vec3, [bx, by, bz]: Vec3) {
   return ax * bx + ay * by + az * bz;
+}
+
+function createCameraState(state: GameState): CameraState {
+  return {
+    eye: [state.x, state.radius * 6.8, state.z + state.radius * 10.8],
+    target: [state.x, state.radius * 0.9, state.z - state.radius * 3.2],
+    up: [0, 1, 0],
+    heading: 0,
+    bank: 0,
+    fov: Math.PI / 3.15,
+    speed01: 0,
+    previousVx: 0,
+    previousVz: 0,
+  };
+}
+
+function resetCamera(camera: CameraState, state: GameState) {
+  const fresh = createCameraState(state);
+  camera.eye = fresh.eye;
+  camera.target = fresh.target;
+  camera.up = fresh.up;
+  camera.heading = fresh.heading;
+  camera.bank = fresh.bank;
+  camera.fov = fresh.fov;
+  camera.speed01 = fresh.speed01;
+  camera.previousVx = fresh.previousVx;
+  camera.previousVz = fresh.previousVz;
+}
+
+function updateCamera(camera: CameraState, state: GameState, dt: number) {
+  const radius = Math.max(state.radius, 0.01);
+  const speed = Math.hypot(state.vx, state.vz);
+  const speed01 = clamp(speed / (radius * 9.2), 0, 1);
+  const desiredHeading = state.reducedMotion
+    ? 0
+    : speed > radius * 0.16
+      ? Math.atan2(state.vx, -state.vz)
+      : camera.heading;
+  const headingDelta = wrapAngle(desiredHeading - camera.heading);
+  const headingResponse = state.reducedMotion
+    ? 1
+    : 1 - Math.pow(0.12, dt);
+  camera.heading = wrapAngle(camera.heading + headingDelta * headingResponse);
+
+  const turnImpulse =
+    (state.vx * camera.previousVz - state.vz * camera.previousVx) /
+    Math.max(radius * radius * 42, 0.01);
+  const desiredBank = state.reducedMotion ? 0 : clamp(turnImpulse, -1, 1) * 0.15;
+  camera.bank = mix(camera.bank, desiredBank, 1 - Math.pow(0.007, dt));
+  camera.previousVx = state.vx;
+  camera.previousVz = state.vz;
+  camera.speed01 = mix(camera.speed01, speed01, 1 - Math.pow(0.018, dt));
+  const framingSpeed01 = state.reducedMotion ? 0 : camera.speed01;
+
+  const forwardX = Math.sin(camera.heading);
+  const forwardZ = -Math.cos(camera.heading);
+  const rightX = Math.cos(camera.heading);
+  const rightZ = Math.sin(camera.heading);
+  const portrait = typeof window !== "undefined" && window.innerHeight > window.innerWidth * 1.12;
+  let distance = radius * mix(10.3, 13.7, framingSpeed01);
+  let height = radius * mix(6.8, 5.55, framingSpeed01);
+  let lookAhead = radius * mix(3.15, 7.25, framingSpeed01);
+  if (portrait) {
+    distance *= 0.92;
+    height *= 1.22;
+    lookAhead *= 1.28;
+  }
+  const kick = state.reducedMotion ? 0 : state.cameraKick;
+  distance += radius * kick * 0.82;
+  height += radius * kick * 0.2;
+
+  const desiredEye: Vec3 = [
+    state.x - forwardX * distance + rightX * camera.bank * radius * 1.8,
+    height,
+    state.z - forwardZ * distance + rightZ * camera.bank * radius * 1.8,
+  ];
+  const desiredTarget: Vec3 = [
+    state.x + forwardX * lookAhead,
+    radius * mix(0.82, 1.08, framingSpeed01),
+    state.z + forwardZ * lookAhead,
+  ];
+  const eyeResponse = 1 - Math.pow(0.0008, dt);
+  const targetResponse = 1 - Math.pow(0.00004, dt);
+  for (let axis = 0; axis < 3; axis += 1) {
+    camera.eye[axis] = mix(camera.eye[axis], desiredEye[axis], eyeResponse);
+    camera.target[axis] = mix(camera.target[axis], desiredTarget[axis], targetResponse);
+  }
+  const desiredFov = state.reducedMotion
+    ? Math.PI / 3.15
+    : mix(Math.PI / 3.15, Math.PI / 2.66, camera.speed01);
+  camera.fov = mix(camera.fov, desiredFov, 1 - Math.pow(0.008, dt));
+  camera.up = vecNormalize([
+    rightX * Math.sin(camera.bank),
+    Math.cos(camera.bank),
+    rightZ * Math.sin(camera.bank),
+  ]);
 }
 
 function mat4Multiply(a: Mat4, b: Mat4): Mat4 {
@@ -373,6 +491,17 @@ type GpuMesh = {
   normal: WebGLBuffer;
   index: WebGLBuffer;
   count: number;
+};
+
+type DrawCommand = {
+  meshName: MeshName;
+  color: Vec3;
+  position: Vec3;
+  scale: Vec3;
+  rotation: Vec3;
+  alpha: number;
+  gloss: number;
+  distanceSquared: number;
 };
 
 function makeCube(): RawMesh {
@@ -468,19 +597,29 @@ class WebGlToyRenderer {
   private viewProjectionLocation: WebGLUniformLocation;
   private colorLocation: WebGLUniformLocation;
   private alphaLocation: WebGLUniformLocation;
+  private cameraLocation: WebGLUniformLocation;
+  private fogColorLocation: WebGLUniformLocation;
+  private fogNearLocation: WebGLUniformLocation;
+  private fogFarLocation: WebGLUniformLocation;
+  private glossLocation: WebGLUniformLocation;
+  private normalScaleLocation: WebGLUniformLocation;
   private viewProjection: Mat4 = new Float32Array(16);
   private canvas: HTMLCanvasElement;
+  private lowQuality: boolean;
+  private transparentCommands: DrawCommand[] = [];
+  private cameraEye: Vec3 = [0, 0, 0];
 
-  constructor(canvas: HTMLCanvasElement) {
+  constructor(canvas: HTMLCanvasElement, lowQuality = false) {
     const gl = canvas.getContext("webgl", {
       alpha: false,
       antialias: true,
-      preserveDrawingBuffer: true,
+      preserveDrawingBuffer: !lowQuality,
     });
     if (!gl) {
       throw new Error("이 기기에서 WebGL을 사용할 수 없습니다.");
     }
     this.canvas = canvas;
+    this.lowQuality = lowQuality;
     this.gl = gl;
     const vertexShader = this.compile(
       gl.VERTEX_SHADER,
@@ -489,12 +628,13 @@ class WebGlToyRenderer {
         attribute vec3 aNormal;
         uniform mat4 uModel;
         uniform mat4 uViewProjection;
+        uniform vec3 uNormalScale;
         varying vec3 vNormal;
         varying vec3 vWorld;
         void main() {
           vec4 world = uModel * vec4(aPosition, 1.0);
           vWorld = world.xyz;
-          vNormal = normalize(mat3(uModel) * aNormal);
+          vNormal = normalize(mat3(uModel) * (aNormal * uNormalScale));
           gl_Position = uViewProjection * world;
         }
       `,
@@ -507,12 +647,29 @@ class WebGlToyRenderer {
         varying vec3 vWorld;
         uniform vec3 uColor;
         uniform float uAlpha;
+        uniform vec3 uCamera;
+        uniform vec3 uFogColor;
+        uniform float uFogNear;
+        uniform float uFogFar;
+        uniform float uGloss;
         void main() {
-          vec3 lightDirection = normalize(vec3(0.55, 1.0, 0.35));
-          float diffuse = max(dot(normalize(vNormal), lightDirection), 0.0);
-          float bounce = max(dot(normalize(vNormal), vec3(0.0, 1.0, 0.0)), 0.0);
-          float light = 0.57 + diffuse * 0.37 + bounce * 0.08;
-          vec3 color = uColor * light + vec3(0.03);
+          vec3 normal = normalize(vNormal);
+          vec3 lightDirection = normalize(vec3(-0.48, 0.88, 0.34));
+          vec3 viewDirection = normalize(uCamera - vWorld);
+          vec3 halfDirection = normalize(lightDirection + viewDirection);
+          float diffuse = max(dot(normal, lightDirection), 0.0);
+          float skyFill = normal.y * 0.5 + 0.5;
+          float backFill = max(dot(normal, normalize(vec3(0.32, 0.55, -0.72))), 0.0);
+          float rim = pow(1.0 - max(dot(normal, viewDirection), 0.0), 2.2);
+          float specular = pow(max(dot(normal, halfDirection), 0.0), mix(10.0, 42.0, uGloss));
+          vec3 color =
+            uColor * (0.42 + diffuse * 0.43 + skyFill * 0.10 + backFill * 0.06) +
+            vec3(specular * uGloss * 0.34) +
+            mix(uColor, vec3(1.0), 0.45) * rim * (0.10 + uGloss * 0.11);
+          float distanceToCamera = length(uCamera - vWorld);
+          float fog = smoothstep(uFogNear, uFogFar, distanceToCamera);
+          color = mix(color, uFogColor, fog * 0.72);
+          color = pow(max(color, vec3(0.0)), vec3(0.96));
           gl_FragColor = vec4(color, uAlpha);
         }
       `,
@@ -532,11 +689,17 @@ class WebGlToyRenderer {
     this.viewProjectionLocation = this.uniform("uViewProjection");
     this.colorLocation = this.uniform("uColor");
     this.alphaLocation = this.uniform("uAlpha");
+    this.cameraLocation = this.uniform("uCamera");
+    this.fogColorLocation = this.uniform("uFogColor");
+    this.fogNearLocation = this.uniform("uFogNear");
+    this.fogFarLocation = this.uniform("uFogFar");
+    this.glossLocation = this.uniform("uGloss");
+    this.normalScaleLocation = this.uniform("uNormalScale");
     this.meshes = {
       cube: this.upload(makeCube()),
-      sphere: this.upload(makeSphere()),
-      cylinder: this.upload(makeCylinder()),
-      cone: this.upload(makeCylinder(12, 0, 0.55)),
+      sphere: this.upload(lowQuality ? makeSphere(9, 14) : makeSphere(14, 22)),
+      cylinder: this.upload(lowQuality ? makeCylinder(12) : makeCylinder(18)),
+      cone: this.upload(lowQuality ? makeCylinder(12, 0, 0.55) : makeCylinder(18, 0, 0.55)),
     };
     gl.enable(gl.DEPTH_TEST);
     gl.enable(gl.CULL_FACE);
@@ -585,7 +748,7 @@ class WebGlToyRenderer {
   }
 
   resize() {
-    const ratio = Math.min(window.devicePixelRatio || 1, 1.6);
+    const ratio = Math.min(window.devicePixelRatio || 1, this.lowQuality ? 1.15 : 1.6);
     const width = Math.max(1, Math.floor(this.canvas.clientWidth * ratio));
     const height = Math.max(1, Math.floor(this.canvas.clientHeight * ratio));
     if (this.canvas.width !== width || this.canvas.height !== height) {
@@ -595,21 +758,27 @@ class WebGlToyRenderer {
     this.gl.viewport(0, 0, width, height);
   }
 
-  begin(sky: Vec3, eye: Vec3, target: Vec3, far: number) {
+  begin(sky: Vec3, camera: CameraState, far: number, fogNear: number, fogFar: number) {
     this.resize();
     const gl = this.gl;
+    this.transparentCommands.length = 0;
+    this.cameraEye = [camera.eye[0], camera.eye[1], camera.eye[2]];
     gl.clearColor(sky[0], sky[1], sky[2], 1);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
     gl.useProgram(this.program);
     const projection = mat4Perspective(
-      Math.PI / 3.05,
+      camera.fov,
       this.canvas.width / Math.max(this.canvas.height, 1),
       Math.max(0.05, far / 3000),
       far,
     );
-    const view = mat4LookAt(eye, target, [0, 1, 0]);
+    const view = mat4LookAt(camera.eye, camera.target, camera.up);
     this.viewProjection = mat4Multiply(projection, view);
     gl.uniformMatrix4fv(this.viewProjectionLocation, false, this.viewProjection);
+    gl.uniform3fv(this.cameraLocation, camera.eye);
+    gl.uniform3fv(this.fogColorLocation, sky);
+    gl.uniform1f(this.fogNearLocation, fogNear);
+    gl.uniform1f(this.fogFarLocation, fogFar);
   }
 
   draw(
@@ -619,17 +788,55 @@ class WebGlToyRenderer {
     scale: Vec3,
     rotation: Vec3 = [0, 0, 0],
     alpha = 1,
+    gloss = 0.22,
   ) {
+    if (alpha < 0.999) {
+      const dx = position[0] - this.cameraEye[0];
+      const dy = position[1] - this.cameraEye[1];
+      const dz = position[2] - this.cameraEye[2];
+      this.transparentCommands.push({
+        meshName,
+        color,
+        position,
+        scale,
+        rotation,
+        alpha,
+        gloss,
+        distanceSquared: dx * dx + dy * dy + dz * dz,
+      });
+      return;
+    }
+    this.drawImmediate({ meshName, color, position, scale, rotation, alpha, gloss, distanceSquared: 0 });
+  }
+
+  flushTransparent() {
+    if (this.transparentCommands.length === 0) return;
     const gl = this.gl;
-    const mesh = this.meshes[meshName];
+    this.transparentCommands.sort((a, b) => b.distanceSquared - a.distanceSquared);
+    gl.depthMask(false);
+    for (const command of this.transparentCommands) this.drawImmediate(command);
+    gl.depthMask(true);
+    this.transparentCommands.length = 0;
+  }
+
+  private drawImmediate(command: DrawCommand) {
+    const gl = this.gl;
+    const mesh = this.meshes[command.meshName];
+    const { position, rotation, scale } = command;
     let model = mat4Translation(position[0], position[1], position[2]);
     model = mat4Multiply(model, mat4RotationY(rotation[1]));
     model = mat4Multiply(model, mat4RotationX(rotation[0]));
     model = mat4Multiply(model, mat4RotationZ(rotation[2]));
     model = mat4Multiply(model, mat4Scale(scale[0], scale[1], scale[2]));
     gl.uniformMatrix4fv(this.modelLocation, false, model);
-    gl.uniform3fv(this.colorLocation, color);
-    gl.uniform1f(this.alphaLocation, alpha);
+    gl.uniform3fv(this.colorLocation, command.color);
+    gl.uniform1f(this.alphaLocation, command.alpha);
+    gl.uniform1f(this.glossLocation, command.gloss);
+    gl.uniform3fv(this.normalScaleLocation, [
+      1 / Math.max(scale[0] * scale[0], 0.000001),
+      1 / Math.max(scale[1] * scale[1], 0.000001),
+      1 / Math.max(scale[2] * scale[2], 0.000001),
+    ]);
     gl.bindBuffer(gl.ARRAY_BUFFER, mesh.position);
     gl.enableVertexAttribArray(this.positionLocation);
     gl.vertexAttribPointer(this.positionLocation, 3, gl.FLOAT, false, 0, 0);
@@ -717,7 +924,12 @@ function generateItems(eraIndex: number, seed: number): Collectible[] {
   return items;
 }
 
-function createState(eraIndex = 0, reducedMotion = false, seed = 20260730): GameState {
+function createState(
+  eraIndex = 0,
+  reducedMotion = false,
+  seed = 20260730,
+  lowQuality = false,
+): GameState {
   const era = ERAS[eraIndex];
   return {
     mode: "intro",
@@ -742,8 +954,10 @@ function createState(eraIndex = 0, reducedMotion = false, seed = 20260730): Game
     messageTime: 5,
     bumpCooldown: 0,
     shake: 0,
+    cameraKick: 0,
     seed,
     reducedMotion,
+    lowQuality,
     finalReady: false,
   };
 }
@@ -791,98 +1005,398 @@ function makeHud(state: GameState, bestEra: number, bestSize: number): HudSnapsh
   };
 }
 
-function drawItem(renderer: WebGlToyRenderer, item: Collectible, time: number) {
+function rotateGroundPoint(
+  originX: number,
+  originZ: number,
+  yaw: number,
+  localX: number,
+  localZ: number,
+) {
+  const c = Math.cos(yaw);
+  const s = Math.sin(yaw);
+  return [originX + c * localX + s * localZ, originZ - s * localX + c * localZ] as const;
+}
+
+function drawCloud(
+  renderer: WebGlToyRenderer,
+  x: number,
+  y: number,
+  z: number,
+  size: number,
+  alpha: number,
+) {
+  const cloud: Vec3 = [0.98, 0.98, 0.94];
+  renderer.draw("sphere", cloud, [x, y, z], [size * 2.2, size * 0.72, size], [0, 0, 0], alpha, 0.12);
+  renderer.draw("sphere", cloud, [x - size * 0.9, y - size * 0.08, z], [size * 1.2, size * 0.58, size * 0.78], [0, 0, 0], alpha, 0.12);
+  renderer.draw("sphere", cloud, [x + size * 0.95, y - size * 0.12, z], [size * 1.35, size * 0.62, size * 0.82], [0, 0, 0], alpha, 0.12);
+}
+
+function drawEraLandmark(
+  renderer: WebGlToyRenderer,
+  eraIndex: number,
+  x: number,
+  z: number,
+  scale: number,
+  yaw: number,
+  time: number,
+) {
+  const focus = THEMES[eraIndex].color;
+  const dark = mixColor(focus, [0.10, 0.16, 0.18], 0.45);
+  const light = mixColor(focus, [1, 0.96, 0.78], 0.5);
+  renderer.draw("cylinder", [0.12, 0.18, 0.19], [x, 0.01, z], [scale * 1.15, 0.025, scale * 1.15], [0, 0, 0], 0.18);
+
+  if (eraIndex === 0) {
+    renderer.draw("cube", [0.72, 0.48, 0.25], [x, scale * 0.58, z], [scale * 1.45, scale * 1.1, scale * 1.2], [0, yaw, 0], 1, 0.08);
+    renderer.draw("cone", [0.86, 0.65, 0.31], [x, scale * 1.42, z], [scale * 1.35, scale * 0.95, scale * 1.35], [0, yaw, 0], 1, 0.08);
+    renderer.draw("cube", dark, [x, scale * 0.45, z - scale * 0.62], [scale * 0.32, scale * 0.65, scale * 0.08], [0, yaw, 0]);
+  } else if (eraIndex === 1) {
+    renderer.draw("cube", dark, [x, scale * 1.35, z], [scale * 0.28, scale * 2.7, scale * 0.28], [0, yaw, 0]);
+    renderer.draw("cube", focus, [x, scale * 2.6, z], [scale * 2.2, scale * 0.22, scale * 0.22], [0, yaw, -0.04]);
+    const hook = rotateGroundPoint(x, z, yaw, scale * 0.92, 0);
+    renderer.draw("cylinder", light, [hook[0], scale * 1.8, hook[1]], [scale * 0.1, scale * 1.35, scale * 0.1]);
+    renderer.draw("cube", [0.70, 0.42, 0.22], [x, scale * 0.32, z], [scale * 1.7, scale * 0.6, scale * 1.25], [0, yaw, 0]);
+  } else if (eraIndex === 2) {
+    renderer.draw("cube", [0.18, 0.51, 0.74], [x, scale * 0.48, z], [scale * 2.4, scale * 0.9, scale * 1.1], [0, yaw, 0], 1, 0.18);
+    renderer.draw("cube", light, [x, scale * 1.02, z], [scale * 1.25, scale * 0.35, scale * 0.9], [0, yaw, 0], 1, 0.25);
+    for (const side of [-0.78, 0.78]) {
+      const wheel = rotateGroundPoint(x, z, yaw, side * scale, -scale * 0.54);
+      renderer.draw("cylinder", [0.08, 0.11, 0.14], [wheel[0], scale * 0.22, wheel[1]], [scale * 0.34, scale * 0.2, scale * 0.34], [Math.PI / 2, yaw, 0]);
+    }
+  } else if (eraIndex === 3) {
+    renderer.draw("cylinder", dark, [x, scale * 1.45, z], [scale * 0.16, scale * 2.9, scale * 0.16]);
+    for (let ring = 0; ring < 3; ring += 1) {
+      const pulse = (time * 0.55 + ring * 0.7) % 2.1;
+      renderer.draw(
+        "sphere",
+        focus,
+        [x, scale * (2.65 + pulse * 0.1), z],
+        [scale * (0.42 + pulse * 0.42), scale * 0.08, scale * (0.42 + pulse * 0.42)],
+        [0, 0, 0],
+        clamp(0.65 - pulse * 0.22, 0.12, 0.65),
+        0.4,
+      );
+    }
+    renderer.draw("cone", light, [x, scale * 3.0, z], [scale * 0.45, scale * 0.9, scale * 0.45], [0, yaw, 0], 1, 0.55);
+  } else {
+    renderer.draw("cylinder", [0.31, 0.26, 0.15], [x, scale * 0.82, z], [scale * 0.35, scale * 1.65, scale * 0.35]);
+    renderer.draw("sphere", focus, [x, scale * 1.9, z], [scale * 1.55, scale * 1.3, scale * 1.55], [0, yaw, 0], 1, 0.25);
+    renderer.draw("sphere", light, [x, scale * 1.7, z], [scale * 1.85, scale * 1.02, scale * 1.85], [0, -yaw, 0], 0.3, 0.72);
+  }
+}
+
+function drawEraEnvironment(
+  renderer: WebGlToyRenderer,
+  state: GameState,
+  camera: CameraState,
+  time: number,
+) {
+  const era = ERAS[state.era];
+  const base = era.baseRadius;
+  const half = era.arenaUnits * base;
+  const groundEdge = mixColor(era.ground, [0.12, 0.18, 0.19], 0.18);
+  const groundCenter = mixColor(era.ground, [1, 0.96, 0.78], 0.1);
+  const gridColor =
+    era.focus === "communication"
+      ? mixColor([0.42, 0.45, 0.66], era.sky, 0.16)
+      : mixColor([0.72, 0.68, 0.52], era.ground, 0.22);
+
+  renderer.draw("cube", groundEdge, [0, -base * 0.18, 0], [half * 2.35, base * 0.36, half * 2.35], [0, 0, 0], 1, 0.04);
+  renderer.draw("cube", groundCenter, [0, base * 0.005, 0], [half * 1.9, base * 0.08, half * 1.9], [0, 0, 0], 1, 0.06);
+
+  for (let index = -6; index <= 6; index += 1) {
+    const offset = index * base * 4.1;
+    const strong = index === 0 ? 0.32 : 0.16;
+    renderer.draw("cube", gridColor, [offset, base * 0.07, 0], [base * 0.032, base * 0.012, half * 1.82], [0, 0, 0], strong);
+    renderer.draw("cube", gridColor, [0, base * 0.071, offset], [half * 1.82, base * 0.012, base * 0.032], [0, 0, 0], strong);
+  }
+  const forwardX = Math.sin(camera.heading);
+  const forwardZ = -Math.cos(camera.heading);
+  const rightX = Math.cos(camera.heading);
+  const rightZ = Math.sin(camera.heading);
+  const sunX = state.x + forwardX * half * 0.78 - rightX * half * 0.46;
+  const sunZ = state.z + forwardZ * half * 0.78 - rightZ * half * 0.46;
+  renderer.draw(
+    "sphere",
+    [1.0, 0.78, 0.25],
+    [sunX, base * 8.8, sunZ],
+    [base * 2.45, base * 2.45, base * 2.45],
+    [0, 0, 0],
+    0.96,
+    0.82,
+  );
+  const cloudCount = state.lowQuality ? 2 : 4;
+  for (let cloudIndex = 0; cloudIndex < cloudCount; cloudIndex += 1) {
+    const cloudT = cloudIndex / (cloudCount - 1);
+    const side = (cloudT - 0.5) * half * 1.02;
+    const drift = state.reducedMotion ? 0 : Math.sin(time * 0.09 + cloudIndex * 2.1) * base * 0.7;
+    drawCloud(
+      renderer,
+      state.x + forwardX * half * mix(0.58, 0.9, cloudT) + rightX * (side + drift),
+      base * (8.6 + (cloudIndex % 2) * 2.2),
+      state.z + forwardZ * half * mix(0.58, 0.9, cloudT) + rightZ * (side + drift),
+      base * mix(1.15, 1.8, (cloudIndex % 3) / 2),
+      0.58,
+    );
+  }
+
+  const random = seededRandom(4400 + state.era * 811);
+  const landmarkCount = state.lowQuality ? 8 : 14;
+  for (let index = 0; index < landmarkCount; index += 1) {
+    const angle = (index / landmarkCount) * Math.PI * 2 + (random() - 0.5) * 0.16;
+    const distance = half * mix(0.9, 0.98, random());
+    drawEraLandmark(
+      renderer,
+      state.era,
+      Math.cos(angle) * distance,
+      Math.sin(angle) * distance,
+      base * mix(0.7, 1.18, random()),
+      -angle + Math.PI / 2,
+      time,
+    );
+  }
+}
+
+function drawItem(
+  renderer: WebGlToyRenderer,
+  item: Collectible,
+  time: number,
+  lowQuality: boolean,
+) {
   const theme = THEME_BY_ID[item.theme];
   const color = theme.color;
-  const bob = item.special ? Math.sin(time * 1.2) * item.r * 0.05 : 0;
+  const bob = item.special
+    ? Math.sin(time * 1.2) * item.r * 0.05
+    : Math.sin(time * 1.45 + item.id * 0.73) * item.r * 0.018;
   const y = item.r * 0.48 + bob;
   const r = item.r;
-  renderer.draw("cylinder", [0.16, 0.20, 0.25], [item.x, 0.012, item.z], [r * 1.15, 0.03, r * 1.15], [0, 0, 0], 0.22);
+  renderer.draw(
+    "sphere",
+    [0.10, 0.15, 0.17],
+    [item.x, 0.014, item.z],
+    [r * 1.18, r * 0.035, r * 0.78],
+    [0, item.yaw, 0],
+    item.special ? 0.07 : 0.12,
+  );
+  if (item.special) {
+    renderer.draw(
+      "sphere",
+      [1.0, 0.84, 0.28],
+      [item.x, r * 2.08 + bob, item.z],
+      [r * 0.16, r * 0.16, r * 0.16],
+      [0, 0, 0],
+      0.9,
+      1,
+    );
+  }
 
   if (item.special && item.theme === "life") {
-    renderer.draw("sphere", [0.58, 0.90, 0.83], [item.x, r * 0.52, item.z], [r * 2, r * 1.05, r * 2], [0, time * 0.08, 0], 0.82);
-    renderer.draw("cylinder", color, [item.x, r * 0.23, item.z], [r * 1.65, r * 0.35, r * 1.65]);
-    for (let index = 0; index < 6; index += 1) {
-      const angle = (index / 6) * Math.PI * 2;
+    renderer.draw("cylinder", color, [item.x, r * 0.23, item.z], [r * 1.65, r * 0.35, r * 1.65], [0, 0, 0], 1, 0.32);
+    renderer.draw("sphere", [0.58, 0.90, 0.83], [item.x, r * 0.62, item.z], [r * 2.08, r * 1.25, r * 2.08], [0, time * 0.08, 0], 0.62, 0.9);
+    const ribCount = lowQuality ? 4 : 8;
+    for (let index = 0; index < ribCount; index += 1) {
+      const angle = (index / ribCount) * Math.PI * 2;
+      renderer.draw(
+        "cylinder",
+        [0.88, 0.95, 0.81],
+        [item.x + Math.cos(angle) * r * 1.22, r * 0.69, item.z + Math.sin(angle) * r * 1.22],
+        [r * 0.07, r * 0.92, r * 0.07],
+        [0, 0, 0],
+        0.84,
+        0.45,
+      );
       renderer.draw(
         "sphere",
         [0.18, 0.68, 0.42],
-        [item.x + Math.cos(angle) * r * 0.92, r * 0.56, item.z + Math.sin(angle) * r * 0.92],
-        [r * 0.28, r * 0.46, r * 0.28],
+        [item.x + Math.cos(angle) * r * 0.88, r * 0.58, item.z + Math.sin(angle) * r * 0.88],
+        [r * 0.32, r * 0.48, r * 0.32],
+        [0, angle, 0],
+        1,
+        0.28,
       );
     }
+    renderer.draw("sphere", [0.98, 0.78, 0.25], [item.x, r * 1.7, item.z], [r * 0.22, r * 0.22, r * 0.22], [0, 0, 0], 1, 0.9);
     return;
   }
 
   if (item.theme === "manufacturing") {
-    renderer.draw("cylinder", color, [item.x, y, item.z], [r * 1.1, r * 0.72, r * 1.1], [0, item.yaw + time * 0.1, 0]);
-    renderer.draw("cylinder", [0.95, 0.92, 0.78], [item.x, y + r * 0.45, item.z], [r * 0.35, r * 0.5, r * 0.35]);
-  } else if (item.theme === "construction") {
-    renderer.draw("cube", color, [item.x, y, item.z], [r * 1.3, r * 0.86, r * 0.95], [0, item.yaw, 0]);
-    renderer.draw("cube", [0.96, 0.91, 0.76], [item.x, y + r * 0.52, item.z], [r * 0.35, r * 0.3, r * 0.35], [0, item.yaw, 0]);
-  } else if (item.theme === "transport") {
-    renderer.draw("cube", color, [item.x, y, item.z], [r * 1.6, r * 0.62, r], [0, item.yaw, 0]);
-    const dx = Math.cos(item.yaw) * r * 0.58;
-    const dz = -Math.sin(item.yaw) * r * 0.58;
-    for (const side of [-1, 1]) {
+    const spin = item.yaw + time * 0.14;
+    renderer.draw("cylinder", color, [item.x, y, item.z], [r * 1.12, r * 0.62, r * 1.12], [0, spin, 0], 1, 0.45);
+    const toothCount = lowQuality ? 4 : 8;
+    for (let tooth = 0; tooth < toothCount; tooth += 1) {
+      const angle = spin + (tooth / toothCount) * Math.PI * 2;
       renderer.draw(
-        "cylinder",
-        [0.12, 0.15, 0.19],
-        [item.x + dx * side, r * 0.27, item.z + dz * side],
-        [r * 0.38, r * 0.22, r * 0.38],
-        [Math.PI / 2, item.yaw, 0],
+        "cube",
+        mixColor(color, [1, 0.9, 0.48], 0.18),
+        [item.x + Math.cos(angle) * r * 0.62, y, item.z + Math.sin(angle) * r * 0.62],
+        [r * 0.28, r * 0.22, r * 0.18],
+        [0, -angle, 0],
+        1,
+        0.35,
       );
     }
+    renderer.draw("cylinder", [0.95, 0.92, 0.78], [item.x, y + r * 0.42, item.z], [r * 0.31, r * 0.55, r * 0.31], [0, 0, 0], 1, 0.5);
+  } else if (item.theme === "construction") {
+    renderer.draw("cube", color, [item.x, y, item.z], [r * 1.36, r * 0.84, r * 1.02], [0, item.yaw, 0], 1, 0.22);
+    for (const side of [-0.32, 0.32]) {
+      const stud = rotateGroundPoint(item.x, item.z, item.yaw, side * r, -r * 0.2);
+      renderer.draw("cylinder", [0.98, 0.88, 0.54], [stud[0], y + r * 0.51, stud[1]], [r * 0.18, r * 0.22, r * 0.18], [0, 0, 0], 1, 0.38);
+    }
+    renderer.draw("cube", [0.19, 0.23, 0.25], [item.x, y - r * 0.08, item.z], [r * 1.46, r * 0.08, r * 1.12], [0, item.yaw, 0], 0.58);
+  } else if (item.theme === "transport") {
+    renderer.draw("cube", color, [item.x, y, item.z], [r * 1.68, r * 0.58, r * 1.02], [0, item.yaw, 0], 1, 0.38);
+    renderer.draw("cube", [0.67, 0.90, 0.96], [item.x, y + r * 0.44, item.z], [r * 0.78, r * 0.38, r * 0.86], [0, item.yaw, 0], 0.92, 0.75);
+    for (const sideX of [-0.58, 0.58]) {
+      for (const sideZ of lowQuality ? [-0.42] : [-0.42, 0.42]) {
+        const wheel = rotateGroundPoint(item.x, item.z, item.yaw, sideX * r, sideZ * r);
+        renderer.draw("cylinder", [0.08, 0.11, 0.14], [wheel[0], r * 0.24, wheel[1]], [r * 0.29, r * 0.2, r * 0.29], [Math.PI / 2, item.yaw, 0], 1, 0.3);
+      }
+    }
   } else if (item.theme === "communication") {
-    renderer.draw("cone", color, [item.x, y, item.z], [r * 0.82, r * 1.45, r * 0.82], [0, item.yaw, 0]);
-    renderer.draw("sphere", [0.96, 0.88, 0.34], [item.x, y + r * 0.8, item.z], [r * 0.36, r * 0.36, r * 0.36]);
+    renderer.draw("cone", color, [item.x, y, item.z], [r * 0.78, r * 1.38, r * 0.78], [0, item.yaw, 0], 1, 0.42);
+    renderer.draw("cylinder", [0.18, 0.23, 0.28], [item.x, y + r * 0.72, item.z], [r * 0.11, r * 0.75, r * 0.11], [0, 0, 0], 1, 0.45);
+    const signalCount = lowQuality ? 1 : 3;
+    for (let signal = 0; signal < signalCount; signal += 1) {
+      const angle = time * 1.5 + signal * (Math.PI * 2 / signalCount) + item.yaw;
+      renderer.draw(
+        "sphere",
+        [0.98, 0.88, 0.34],
+        [item.x + Math.cos(angle) * r * 0.42, y + r * (0.92 + signal * 0.1), item.z + Math.sin(angle) * r * 0.42],
+        [r * 0.13, r * 0.13, r * 0.13],
+        [0, 0, 0],
+        1,
+        0.92,
+      );
+    }
   } else {
-    renderer.draw("cylinder", [0.43, 0.29, 0.17], [item.x, y - r * 0.22, item.z], [r * 0.34, r * 0.9, r * 0.34]);
-    renderer.draw("sphere", color, [item.x, y + r * 0.38, item.z], [r * 1.18, r * 1.05, r * 1.18], [0, item.yaw, 0]);
+    renderer.draw("cylinder", [0.43, 0.29, 0.17], [item.x, y - r * 0.24, item.z], [r * 0.32, r * 0.92, r * 0.32], [0, 0, 0], 1, 0.12);
+    renderer.draw("sphere", color, [item.x, y + r * 0.34, item.z], [r * 1.16, r * 1.02, r * 1.16], [0, item.yaw, 0], 1, 0.3);
+    renderer.draw("sphere", mixColor(color, [1, 0.96, 0.58], 0.28), [item.x - r * 0.42, y + r * 0.61, item.z - r * 0.08], [r * 0.52, r * 0.55, r * 0.52], [0, 0, 0], 1, 0.36);
+    if (!lowQuality) {
+      renderer.draw("sphere", mixColor(color, [0.08, 0.42, 0.25], 0.22), [item.x + r * 0.42, y + r * 0.58, item.z + r * 0.12], [r * 0.56, r * 0.6, r * 0.56], [0, 0, 0], 1, 0.28);
+    }
   }
 }
 
-function drawRobot(renderer: WebGlToyRenderer, state: GameState, time: number) {
+function drawRobot(
+  renderer: WebGlToyRenderer,
+  state: GameState,
+  time: number,
+  heading: number,
+) {
   const r = state.radius;
-  const speed = Math.hypot(state.vx, state.vz);
-  const stride = Math.sin(time * 7 + speed) * r * 0.12;
-  const x = state.x;
-  const z = state.z + r * 1.55;
-  renderer.draw("cylinder", [0.12, 0.16, 0.20], [x, 0.01, z], [r * 0.55, 0.025, r * 0.55], [0, 0, 0], 0.18);
-  renderer.draw("cube", [0.97, 0.38, 0.24], [x, r * 0.75, z], [r * 0.72, r * 0.78, r * 0.52]);
-  renderer.draw("sphere", [0.92, 0.96, 0.92], [x, r * 1.32, z], [r * 0.68, r * 0.58, r * 0.62]);
-  renderer.draw("sphere", [0.10, 0.19, 0.24], [x - r * 0.16, r * 1.38, z - r * 0.29], [r * 0.09, r * 0.11, r * 0.08]);
-  renderer.draw("sphere", [0.10, 0.19, 0.24], [x + r * 0.16, r * 1.38, z - r * 0.29], [r * 0.09, r * 0.11, r * 0.08]);
-  renderer.draw("cylinder", [0.20, 0.69, 0.79], [x, r * 1.8, z], [r * 0.08, r * 0.5, r * 0.08]);
-  renderer.draw("sphere", [0.98, 0.77, 0.18], [x, r * 2.02, z], [r * 0.18, r * 0.18, r * 0.18]);
-  renderer.draw("cube", [0.19, 0.45, 0.54], [x - r * 0.21, r * 0.28, z + stride], [r * 0.22, r * 0.55, r * 0.24]);
-  renderer.draw("cube", [0.19, 0.45, 0.54], [x + r * 0.21, r * 0.28, z - stride], [r * 0.22, r * 0.55, r * 0.24]);
+  const speed01 = clamp(Math.hypot(state.vx, state.vz) / Math.max(r * 9.2, 0.01), 0, 1);
+  const stride = Math.sin(time * mix(5.5, 10, speed01)) * r * mix(0.05, 0.15, speed01);
+  const forwardX = Math.sin(heading);
+  const forwardZ = -Math.cos(heading);
+  const centerX = state.x - forwardX * r * 1.7;
+  const centerZ = state.z - forwardZ * r * 1.7;
+  const point = (localX: number, localZ: number) =>
+    rotateGroundPoint(centerX, centerZ, heading, localX, localZ);
+  const leftEye = point(-r * 0.16, -r * 0.29);
+  const rightEye = point(r * 0.16, -r * 0.29);
+  const leftLeg = point(-r * 0.22, stride);
+  const rightLeg = point(r * 0.22, -stride);
+  const leftHand = point(-r * 0.62, -r * 0.34);
+  const rightHand = point(r * 0.62, -r * 0.34);
+  const lean = -speed01 * 0.16;
+
+  renderer.draw("cylinder", [0.08, 0.13, 0.16], [centerX, 0.012, centerZ], [r * 0.62, 0.028, r * 0.62], [0, 0, 0], 0.2);
+  renderer.draw("cube", [0.97, 0.38, 0.24], [centerX, r * 0.75, centerZ], [r * 0.78, r * 0.82, r * 0.56], [lean, heading, 0], 1, 0.36);
+  renderer.draw("cube", [0.98, 0.74, 0.25], [centerX, r * 0.8, centerZ - forwardZ * r * 0.3], [r * 0.34, r * 0.28, r * 0.08], [lean, heading, 0], 1, 0.55);
+  renderer.draw("sphere", [0.92, 0.96, 0.92], [centerX, r * 1.35, centerZ], [r * 0.72, r * 0.62, r * 0.66], [0, heading, 0], 1, 0.72);
+  renderer.draw("sphere", [0.06, 0.16, 0.22], [leftEye[0], r * 1.42, leftEye[1]], [r * 0.09, r * 0.12, r * 0.08], [0, heading, 0], 1, 0.92);
+  renderer.draw("sphere", [0.06, 0.16, 0.22], [rightEye[0], r * 1.42, rightEye[1]], [r * 0.09, r * 0.12, r * 0.08], [0, heading, 0], 1, 0.92);
+  renderer.draw("cylinder", [0.20, 0.69, 0.79], [centerX, r * 1.84, centerZ], [r * 0.075, r * 0.48, r * 0.075], [0, 0, 0], 1, 0.55);
+  renderer.draw("sphere", [0.98, 0.77, 0.18], [centerX, r * 2.06, centerZ], [r * 0.19, r * 0.19, r * 0.19], [0, 0, 0], 1, 0.9);
+  renderer.draw("cube", [0.19, 0.45, 0.54], [leftLeg[0], r * 0.29, leftLeg[1]], [r * 0.22, r * 0.58, r * 0.25], [0, heading, 0]);
+  renderer.draw("cube", [0.19, 0.45, 0.54], [rightLeg[0], r * 0.29, rightLeg[1]], [r * 0.22, r * 0.58, r * 0.25], [0, heading, 0]);
+  renderer.draw("sphere", [0.96, 0.42, 0.29], [leftHand[0], r * 0.86, leftHand[1]], [r * 0.18, r * 0.18, r * 0.18], [0, 0, 0], 1, 0.45);
+  renderer.draw("sphere", [0.96, 0.42, 0.29], [rightHand[0], r * 0.86, rightHand[1]], [r * 0.18, r * 0.18, r * 0.18], [0, 0, 0], 1, 0.45);
+}
+
+function drawSpeedEffects(
+  renderer: WebGlToyRenderer,
+  state: GameState,
+  camera: CameraState,
+  time: number,
+) {
+  if (state.reducedMotion || camera.speed01 < 0.16) return;
+  const r = state.radius;
+  const forwardX = Math.sin(camera.heading);
+  const forwardZ = -Math.cos(camera.heading);
+  const rightX = Math.cos(camera.heading);
+  const rightZ = Math.sin(camera.heading);
+  for (let index = 0; index < 6; index += 1) {
+    const distance = r * (1.8 + index * 1.05);
+    const side = Math.sin(time * 5 + index * 2.4) * r * (0.3 + index * 0.06);
+    const fade = camera.speed01 * (1 - index / 7) * 0.3;
+    renderer.draw(
+      "sphere",
+      mixColor([1.0, 0.80, 0.24], ERAS[state.era].sky, index / 8),
+      [
+        state.x - forwardX * distance + rightX * side,
+        r * mix(0.62, 0.18, index / 6),
+        state.z - forwardZ * distance + rightZ * side,
+      ],
+      [r * mix(0.55, 0.16, index / 6), r * 0.14, r * mix(0.9, 0.25, index / 6)],
+      [0, camera.heading, 0],
+      fade,
+      0.72,
+    );
+  }
 }
 
 function drawBall(renderer: WebGlToyRenderer, state: GameState, time: number) {
   const r = state.radius;
-  renderer.draw("cylinder", [0.11, 0.16, 0.19], [state.x, 0.015, state.z], [r * 1.2, 0.028, r * 1.2], [0, 0, 0], 0.24);
+  renderer.draw("cylinder", [0.08, 0.13, 0.16], [state.x, 0.018, state.z], [r * 1.28, 0.034, r * 1.28], [0, 0, 0], 0.22);
   renderer.draw(
     "sphere",
-    [1.0, 0.82, 0.22],
+    [0.98, 0.66, 0.10],
     [state.x, r, state.z],
     [r * 2, r * 2, r * 2],
-    [state.rollX, time * 0.13, state.rollZ],
+    [state.rollX, time * 0.15, state.rollZ],
+    1,
+    0.82,
   );
   renderer.draw(
     "sphere",
-    [0.98, 0.94, 0.70],
-    [state.x - r * 0.22, r * 1.22, state.z - r * 0.45],
-    [r * 0.54, r * 0.42, r * 0.28],
-    [state.rollX, 0, state.rollZ],
+    [1.0, 0.91, 0.46],
+    [state.x, r * 1.03, state.z],
+    [r * 2.08, r * 2.08, r * 2.08],
+    [state.rollX * 0.7, -time * 0.1, state.rollZ * 0.7],
+    0.18,
+    1,
   );
-  const visibleAttachments = state.attachments.slice(-18);
+  const nodeCount = state.lowQuality ? 6 : 12;
+  for (let node = 0; node < nodeCount; node += 1) {
+    const angle = (node / nodeCount) * Math.PI * 2 + time * 0.34;
+    const wave = Math.sin(angle * 2 + state.rollX) * r * 0.18;
+    renderer.draw(
+      "sphere",
+      node % 2 === 0 ? [0.98, 0.33, 0.22] : [0.16, 0.72, 0.76],
+      [state.x + Math.cos(angle) * r * 1.03, r + wave, state.z + Math.sin(angle) * r * 1.03],
+      [r * 0.105, r * 0.105, r * 0.105],
+      [0, 0, 0],
+      1,
+      0.72,
+    );
+  }
+  renderer.draw(
+    "sphere",
+    [1.0, 0.98, 0.82],
+    [state.x - r * 0.28, r * 1.28, state.z - r * 0.5],
+    [r * 0.5, r * 0.37, r * 0.24],
+    [state.rollX, 0, state.rollZ],
+    0.88,
+    1,
+  );
+  const visibleAttachments = state.attachments.slice(state.lowQuality ? -10 : -20);
   visibleAttachments.forEach((attachment, index) => {
     const random = seededRandom(attachment.seed);
     const theta = random() * Math.PI * 2 + state.rollZ;
     const phi = mix(0.35, Math.PI - 0.35, random());
-    const distance = r * 1.03;
-    const size = r * mix(0.14, 0.25, random());
+    const distance = r * 1.05;
+    const size = r * mix(0.13, 0.23, random());
     const x = state.x + Math.sin(phi) * Math.cos(theta) * distance;
     const y = r + Math.cos(phi) * distance;
     const z = state.z + Math.sin(phi) * Math.sin(theta) * distance;
@@ -892,46 +1406,63 @@ function drawBall(renderer: WebGlToyRenderer, state: GameState, time: number) {
       [x, y, z],
       [size, size, size],
       [theta, phi + time * 0.06 + index * 0.1, theta * 0.4],
+      1,
+      0.5,
     );
   });
 }
 
-function drawWorld(renderer: WebGlToyRenderer, state: GameState, time: number) {
+function drawWorld(
+  renderer: WebGlToyRenderer,
+  state: GameState,
+  camera: CameraState,
+  time: number,
+) {
   const era = ERAS[state.era];
   const base = era.baseRadius;
-  const shakeX = state.reducedMotion ? 0 : Math.sin(time * 48) * state.shake * base * 0.08;
-  const eye: Vec3 = [
-    state.x + shakeX,
-    state.radius * 7.2,
-    state.z + state.radius * 11.8,
-  ];
-  const target: Vec3 = [state.x, state.radius * 0.72, state.z - state.radius * 3.6];
-  renderer.begin(era.sky, eye, target, base * 180);
   const half = era.arenaUnits * base;
-  renderer.draw("cube", era.ground, [0, -base * 0.12, 0], [half * 2.2, base * 0.25, half * 2.2]);
-
-  const gridColor: Vec3 = era.focus === "communication" ? [0.42, 0.45, 0.66] : [0.72, 0.68, 0.52];
-  for (let index = -5; index <= 5; index += 1) {
-    const offset = index * base * 4.2;
-    renderer.draw("cube", gridColor, [offset, base * 0.01, 0], [base * 0.045, base * 0.018, half * 2], [0, 0, 0], 0.22);
-    renderer.draw("cube", gridColor, [0, base * 0.012, offset], [half * 2, base * 0.018, base * 0.045], [0, 0, 0], 0.22);
-  }
+  const visualTime = state.reducedMotion ? 0 : time;
+  const shakeAmplitude = state.reducedMotion ? 0 : state.shake * base * 0.075;
+  const renderCamera: CameraState = {
+    ...camera,
+    eye: [
+      camera.eye[0] + Math.sin(time * 31) * shakeAmplitude,
+      camera.eye[1] + Math.cos(time * 23) * shakeAmplitude * 0.45,
+      camera.eye[2] + Math.sin(time * 19 + 1.1) * shakeAmplitude,
+    ],
+    target: [
+      camera.target[0] + Math.sin(time * 17) * shakeAmplitude * 0.35,
+      camera.target[1],
+      camera.target[2] + Math.cos(time * 21) * shakeAmplitude * 0.35,
+    ],
+  };
+  renderer.begin(
+    mixColor(era.sky, [1, 0.96, 0.82], 0.04),
+    renderCamera,
+    base * 190,
+    half * 0.72,
+    half * 1.9,
+  );
+  drawEraEnvironment(renderer, state, camera, visualTime);
 
   for (const item of state.items) {
-    if (!item.collected) drawItem(renderer, item, time);
+    if (!item.collected) drawItem(renderer, item, visualTime, state.lowQuality);
   }
   for (const particle of state.particles) {
     renderer.draw(
       "sphere",
       particle.color,
       [particle.x, particle.y, particle.z],
-      [base * 0.12, base * 0.12, base * 0.12],
+      [base * 0.13, base * 0.13, base * 0.13],
       [0, 0, 0],
       clamp(particle.life * 2, 0, 1),
+      0.82,
     );
   }
-  drawRobot(renderer, state, time);
-  drawBall(renderer, state, time);
+  drawSpeedEffects(renderer, state, camera, visualTime);
+  drawRobot(renderer, state, visualTime, camera.heading);
+  drawBall(renderer, state, visualTime);
+  renderer.flushTransparent();
 }
 
 function loadProgress() {
@@ -1019,8 +1550,12 @@ export default function TimeRollGame() {
     if (!canvas) return;
     let active = true;
     let renderer: WebGlToyRenderer;
+    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const lowQuality =
+      (window.matchMedia("(pointer: coarse)").matches && Math.min(window.innerWidth, window.innerHeight) < 900) ||
+      (navigator.hardwareConcurrency || 8) <= 4;
     try {
-      renderer = new WebGlToyRenderer(canvas);
+      renderer = new WebGlToyRenderer(canvas, lowQuality);
     } catch (error) {
       const message = error instanceof Error ? error.message : "3D 화면을 시작하지 못했습니다.";
       queueMicrotask(() => {
@@ -1031,9 +1566,9 @@ export default function TimeRollGame() {
       };
     }
 
-    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     const saved = loadProgress();
-    const state = createState(0, reducedMotion);
+    const state = createState(0, reducedMotion, 20260730, lowQuality);
+    const camera = createCameraState(state);
     gameRef.current = state;
     let bestEra = saved.bestEra;
     let bestSize = saved.bestSize;
@@ -1078,7 +1613,9 @@ export default function TimeRollGame() {
       state.collectedLabel = "";
       state.message = era.mission;
       state.messageTime = 4.5;
+      state.cameraKick = 0;
       state.finalReady = false;
+      resetCamera(camera, state);
       syncHud(true);
     };
 
@@ -1096,6 +1633,7 @@ export default function TimeRollGame() {
       state.message = `${item.name} 모았어요!`;
       state.messageTime = 1.6;
       state.shake = state.reducedMotion ? 0 : item.special ? 0.9 : 0.35;
+      state.cameraKick = Math.max(state.cameraKick, item.special ? 1 : 0.42);
       if (!state.reducedMotion) {
         const random = seededRandom(item.id * 311 + state.totalCollected * 47);
         for (let index = 0; index < 10; index += 1) {
@@ -1145,6 +1683,7 @@ export default function TimeRollGame() {
       state.messageTime = Math.max(0, state.messageTime - safeDt);
       state.bumpCooldown = Math.max(0, state.bumpCooldown - safeDt);
       state.shake = Math.max(0, state.shake - safeDt * 2.5);
+      state.cameraKick = Math.max(0, state.cameraKick - safeDt * 2.2);
       for (const particle of state.particles) {
         particle.life -= safeDt;
         particle.vy -= state.radius * 4.5 * safeDt;
@@ -1154,6 +1693,7 @@ export default function TimeRollGame() {
       }
       state.particles = state.particles.filter((particle) => particle.life > 0);
       if (state.mode !== "playing") {
+        updateCamera(camera, state, safeDt);
         uiAccumulator += safeDt;
         syncHud();
         return;
@@ -1176,6 +1716,12 @@ export default function TimeRollGame() {
         inputX /= magnitude;
         inputZ /= magnitude;
       }
+      const screenRight = inputX;
+      const screenForward = -inputZ;
+      const cameraCos = Math.cos(camera.heading);
+      const cameraSin = Math.sin(camera.heading);
+      inputX = screenRight * cameraCos + screenForward * cameraSin;
+      inputZ = screenRight * cameraSin - screenForward * cameraCos;
 
       const boosting =
         (keys.has("ShiftLeft") || keys.has("ShiftRight") || boostPressedRef.current) &&
@@ -1248,6 +1794,7 @@ export default function TimeRollGame() {
         save();
         playTone(280, 0.22, -100);
       }
+      updateCamera(camera, state, safeDt);
       uiAccumulator += safeDt;
       syncHud();
     };
@@ -1287,6 +1834,16 @@ export default function TimeRollGame() {
         },
         timerSeconds: Number(state.timer.toFixed(1)),
         boost: Number(state.boost.toFixed(2)),
+        reducedMotion: state.reducedMotion,
+        quality: state.lowQuality ? "mobile" : "high",
+        camera: {
+          heading: Number(camera.heading.toFixed(3)),
+          bank: Number(camera.bank.toFixed(3)),
+          fovDegrees: Number((camera.fov * 180 / Math.PI).toFixed(1)),
+          speed01: Number(camera.speed01.toFixed(2)),
+          eye: camera.eye.map((value) => Number(value.toFixed(2))),
+          target: camera.target.map((value) => Number(value.toFixed(2))),
+        },
         goal: {
           collected: state.eraCollected,
           required: ERAS[state.era].goal,
@@ -1359,7 +1916,7 @@ export default function TimeRollGame() {
       const step = 1 / 60;
       const count = Math.max(1, Math.ceil(ms / (1000 / 60)));
       for (let index = 0; index < count; index += 1) update(step);
-      drawWorld(renderer, state, performance.now() / 1000);
+      drawWorld(renderer, state, camera, performance.now() / 1000);
       syncHud(true);
     };
     const exposeTestControls =
@@ -1429,7 +1986,7 @@ export default function TimeRollGame() {
       const elapsed = clamp((time - lastTime) / 1000, 0, 0.05);
       lastTime = time;
       if (time > manualUntil) update(elapsed);
-      drawWorld(renderer, state, time / 1000);
+      drawWorld(renderer, state, camera, time / 1000);
       requestAnimationFrame(frame);
     };
     syncHud(true);
