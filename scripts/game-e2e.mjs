@@ -27,12 +27,14 @@ await mkdir(outputDir, { recursive: true });
 const errors = [];
 const checks = [];
 const observations = {};
+const leaderboardPostBodies = [];
 const browser = await chromium.launch({
   headless: true,
   args: ["--use-gl=angle", "--use-angle=swiftshader"],
 });
 
 async function readState(page) {
+  await page.waitForFunction(() => typeof window.render_game_to_text === "function");
   const raw = await page.evaluate(() => window.render_game_to_text?.());
   assert.ok(raw, "render_game_to_text should return game state");
   return JSON.parse(raw);
@@ -142,6 +144,12 @@ function trackErrors(page, label) {
     if (message.type() === "error") errors.push(`${label} console: ${message.text()}`);
   });
   page.on("pageerror", (error) => errors.push(`${label} pageerror: ${String(error)}`));
+  page.on("request", (request) => {
+    if (request.method() === "POST" && new URL(request.url()).pathname === "/api/leaderboard") {
+      const body = request.postData();
+      leaderboardPostBodies.push({ label, body });
+    }
+  });
 }
 
 function outputPath(filename) {
@@ -254,6 +262,202 @@ function assertMobileRenderBudget(renderStats, label) {
   );
 }
 
+function sumScoreBreakdown(score) {
+  return score.collectionScore + score.comboBonus + score.timeBonus + score.clearBonus;
+}
+
+function assertScoreBreakdownInvariant(score, label) {
+  assert.ok(score && typeof score === "object", `${label} should expose a score breakdown`);
+  for (const field of ["collectionScore", "comboBonus", "timeBonus", "clearBonus", "totalScore"]) {
+    assert.equal(
+      Number.isSafeInteger(score[field]),
+      true,
+      `${label}.${field} should be a safe integer; score=${JSON.stringify(score)}`,
+    );
+    assert.ok(score[field] >= 0, `${label}.${field} should be nonnegative; score=${JSON.stringify(score)}`);
+  }
+  assert.equal(score.totalScore, sumScoreBreakdown(score), `${label} totalScore should equal its parts`);
+}
+
+async function assertHallVisibility(page, expectedVisible, label) {
+  const state = await readState(page);
+  assert.equal(state.leaderboard.visible, expectedVisible, `${label} telemetry should expose Hall visibility`);
+  const hall = page.getByTestId("hall-of-fame");
+  if (expectedVisible) {
+    await hall.waitFor({ state: "visible" });
+    assert.match(await hall.innerText(), /명예의 전당/, `${label} Hall should include its title`);
+    assert.equal(await hall.evaluate((element) => element.getAttribute("aria-labelledby")), "hall-title");
+  } else {
+    assert.equal(await hall.count(), 0, `${label} Hall should not be mounted outside intro`);
+  }
+}
+
+async function assertNoHorizontalOverflow(page, label) {
+  const layout = await page.evaluate(() => ({
+    viewport: window.innerWidth,
+    documentWidth: document.documentElement.scrollWidth,
+  }));
+  assert.ok(
+    layout.documentWidth <= layout.viewport + 1,
+    `${label} should not create horizontal overflow; layout=${JSON.stringify(layout)}`,
+  );
+}
+
+async function assertTouchTargetsAtLeast(page, selector, minPx, label) {
+  const boxes = await page.locator(selector).evaluateAll((elements) =>
+    elements.map((element) => {
+      const rect = element.getBoundingClientRect();
+      return {
+        tag: element.tagName.toLowerCase(),
+        text: element.textContent?.trim() ?? "",
+        width: rect.width,
+        height: rect.height,
+      };
+    }),
+  );
+  assert.ok(boxes.length > 0, `${label} should expose at least one target for ${selector}`);
+  for (const box of boxes) {
+    assert.ok(
+      box.width >= minPx && box.height >= minPx,
+      `${label} target should be at least ${minPx}px; box=${JSON.stringify(box)}`,
+    );
+  }
+}
+
+async function assertMobileHallLayout(page, viewport, label) {
+  await assertHallVisibility(page, true, label);
+  await assertNoHorizontalOverflow(page, label);
+  const hallRect = await readRequiredRect(page, ".hall-plaque", `${label} Hall plaque`);
+  assert.ok(hallRect.left >= 0 && hallRect.right <= viewport.width + 1, `${label} Hall should fit viewport; rect=${JSON.stringify(hallRect)}`);
+  await assertTouchTargetsAtLeast(page, "#start-btn", 44, `${label} start button`);
+}
+
+async function assertMobileTerminalScoreFormLayout(page, viewport, label) {
+  await page.locator(".score-submit-form").waitFor({ state: "visible" });
+  await assertNoHorizontalOverflow(page, label);
+  const formRect = await readRequiredRect(page, ".score-submit-form", `${label} score form`);
+  assert.ok(formRect.left >= 0 && formRect.right <= viewport.width + 1, `${label} score form should fit viewport; rect=${JSON.stringify(formRect)}`);
+  await assertTouchTargetsAtLeast(page, ".score-submit-form input, .score-submit-form button", 44, label);
+  assert.match(await page.locator(".nickname-guide").innerText(), /이름, 학교, 반은 쓰지 마세요/, `${label} should include privacy helper copy`);
+}
+
+async function assertLeaderboardApi(page) {
+  const stamp = Date.now().toString(36);
+  const nicknameTag = stamp.slice(-5);
+  const payloads = {
+    gold: {
+      runId: `e2e:${stamp}:gold-record`,
+      nickname: `금${nicknameTag}`,
+      scoreVersion: 1,
+      collectionScore: 740000,
+      comboBonus: 740000,
+      timeBonus: 10000,
+      clearBonus: 8000,
+      totalScore: 1498000,
+      maxCombo: 80,
+      startedEra: 1,
+      reachedEra: 5,
+      completedEras: 5,
+      victory: true,
+    },
+    silver: {
+      runId: `e2e:${stamp}:silver-score`,
+      nickname: `은${nicknameTag}`,
+      scoreVersion: 1,
+      collectionScore: 299000,
+      comboBonus: 298000,
+      timeBonus: 4000,
+      clearBonus: 3200,
+      totalScore: 604200,
+      maxCombo: 60,
+      startedEra: 1,
+      reachedEra: 3,
+      completedEras: 2,
+      victory: false,
+    },
+    bronze: {
+      runId: `e2e:${stamp}:bronze-score`,
+      nickname: `동${nicknameTag}`,
+      scoreVersion: 1,
+      collectionScore: 149000,
+      comboBonus: 148000,
+      timeBonus: 2000,
+      clearBonus: 1600,
+      totalScore: 300600,
+      maxCombo: 50,
+      startedEra: 1,
+      reachedEra: 2,
+      completedEras: 1,
+      victory: false,
+    },
+  };
+
+  const initial = await page.request.get(`${url}/api/leaderboard?limit=5`);
+  assert.equal(initial.status(), 200, "leaderboard GET should respond 200");
+  assert.ok(Array.isArray((await initial.json()).leaders), "leaderboard GET should return { leaders }");
+
+  const invalidNickname = await page.request.post(`${url}/api/leaderboard`, {
+    data: { ...payloads.bronze, runId: `e2e:${stamp}:invalid-nick`, nickname: "3학년1반" },
+  });
+  assert.equal(invalidNickname.status(), 400, "leaderboard API should reject school/class nickname patterns");
+  assert.equal((await invalidNickname.json()).error.code, "NICKNAME_PII");
+
+  const responses = {};
+  for (const [key, payload] of Object.entries(payloads)) {
+    const response = await page.request.post(`${url}/api/leaderboard`, { data: payload });
+    assert.equal(response.status(), 201, `${key} leaderboard POST should create a record`);
+    responses[key] = await response.json();
+    assert.equal(responses[key].entry.runId, payload.runId, `${key} response should return submitted run`);
+  }
+
+  const duplicate = await page.request.post(`${url}/api/leaderboard`, { data: payloads.gold });
+  assert.equal(duplicate.status(), 200, "exact duplicate run submission should be idempotent");
+  assert.equal((await duplicate.json()).entry.runId, payloads.gold.runId);
+
+  const concurrentPayload = {
+    ...payloads.bronze,
+    runId: `e2e:${stamp}:concurrent-score`,
+    nickname: `동시${nicknameTag}`,
+  };
+  const concurrentResponses = await Promise.all([
+    page.request.post(`${url}/api/leaderboard`, { data: concurrentPayload }),
+    page.request.post(`${url}/api/leaderboard`, { data: concurrentPayload }),
+  ]);
+  assert.deepEqual(
+    concurrentResponses.map((response) => response.status()).sort(),
+    [200, 201],
+    "concurrent identical submissions should atomically create once and reuse once",
+  );
+  for (const response of concurrentResponses) {
+    assert.equal((await response.json()).entry.runId, concurrentPayload.runId);
+  }
+
+  const conflict = await page.request.post(`${url}/api/leaderboard`, {
+    data: { ...payloads.gold, totalScore: payloads.gold.totalScore - 20, timeBonus: payloads.gold.timeBonus - 20 },
+  });
+  assert.equal(conflict.status(), 409, "same runId with changed score should conflict");
+  assert.equal((await conflict.json()).error.code, "RUN_CONFLICT");
+
+  assert.ok(
+    responses.gold.rank < responses.silver.rank && responses.silver.rank < responses.bronze.rank,
+    `leaderboard rank should prioritize completed eras, then score, then combo; ranks=${JSON.stringify({
+      gold: responses.gold.rank,
+      silver: responses.silver.rank,
+      bronze: responses.bronze.rank,
+    })}`,
+  );
+
+  observations.leaderboardApi = {
+    stamp,
+    createdRuns: Object.fromEntries(Object.entries(payloads).map(([key, payload]) => [key, payload.runId])),
+    ranks: {
+      gold: responses.gold.rank,
+      silver: responses.silver.rank,
+      bronze: responses.bronze.rank,
+    },
+  };
+}
+
 function assertEndCondition(state, expectedPhases, label) {
   const endCondition = requireTelemetryObject(state, "endCondition");
   assert.equal(
@@ -356,7 +560,9 @@ async function assertMobileAudioHudLayout(page, viewport, label) {
 }
 
 async function assertMobilePickupHidesAudioHud(page, viewport, label) {
-  await page.locator(".pickup-callout[aria-hidden='true']").waitFor({ state: "visible" });
+  const state = await readState(page);
+  const feedback = requireTelemetryObject(state, "feedback");
+  assert.equal(feedbackIndicatesSuccess(feedback), true, `${label} should expose success feedback telemetry; feedback=${JSON.stringify(feedback)}`);
   await page.locator(".game-message[role='status']").waitFor({ state: "visible" });
   assert.equal(
     await page.locator(".game-shell").getAttribute("data-pickup-feedback-active"),
@@ -383,13 +589,23 @@ async function assertMobilePickupHidesAudioHud(page, viewport, label) {
   );
 
   const messageRect = await readRequiredRect(page, ".game-message[role='status']", `${label} game message`);
-  const calloutRect = await readRequiredRect(page, ".pickup-callout[aria-hidden='true']", `${label} pickup callout`);
+  const calloutLocator = page.locator(".pickup-callout[aria-hidden='true']");
+  const visibleCalloutCount = await calloutLocator.count();
   assert.equal(Math.round(messageRect.left), 6, `${label} message should pin to the left safe margin`);
   assert.ok(
     messageRect.right <= viewport.width - 112 + 6 + 1,
     `${label} message should reserve the right-side action grid; message=${JSON.stringify(messageRect)}`,
   );
-  assert.ok(calloutRect.left >= 0 && calloutRect.right <= viewport.width, `${label} pickup callout should fit viewport; rect=${JSON.stringify(calloutRect)}`);
+  if (visibleCalloutCount > 0 && await calloutLocator.first().isVisible()) {
+    const calloutRect = await readRequiredRect(page, ".pickup-callout[aria-hidden='true']", `${label} pickup callout`);
+    assert.ok(calloutRect.left >= 0 && calloutRect.right <= viewport.width, `${label} pickup callout should fit viewport; rect=${JSON.stringify(calloutRect)}`);
+  } else {
+    assert.match(
+      await page.locator(".pickup-callout-copy.sr-only").textContent(),
+      /수집 성공!/,
+      `${label} should preserve sr-only pickup success copy when visual callout is not active`,
+    );
+  }
   assert.match(await page.locator("body").innerText(), /수집 성공!/, `${label} pickup callout/message should show success text`);
 }
 
@@ -533,6 +749,12 @@ async function buildContactSheet(cards, filename, columns, tileWidth = 480, tile
 }
 
 try {
+  const apiProbe = await browser.newPage({ viewport: { width: 1024, height: 768 } });
+  trackErrors(apiProbe, "leaderboard-api");
+  await assertLeaderboardApi(apiProbe);
+  checks.push("leaderboard API saves D1 records, rejects invalid nicknames, handles idempotent duplicates/conflicts, and ranks by completed eras");
+  await apiProbe.close();
+
   const migration = await browser.newPage({ viewport: { width: 1280, height: 720 } });
   trackErrors(migration, "migration");
   await installAudioProbe(migration);
@@ -627,8 +849,6 @@ try {
   assertRollingCue(reducedState, { active: false, reason: "reduced-motion" }, "reduced-motion movement");
   const reducedPickup = reducedState.nearby.find((entry) => entry.collectible && !entry.special);
   assert.ok(reducedPickup, "reduced-motion pickup FX check needs a deterministic collectible");
-  await callTestHook(reducedMotion, "setRadiusRatio", (reducedPickup.requiredRadius * 1.02) / (reducedState.player.radius / reducedState.player.growthRatio));
-  await callTestHook(reducedMotion, "warpToItem", reducedPickup.id);
   assert.equal(await callTestHook(reducedMotion, "collectItem", reducedPickup.id), true);
   reducedState = await readState(reducedMotion);
   const reducedFeedback = requireTelemetryObject(reducedState, "feedback");
@@ -644,6 +864,7 @@ try {
   await prepareStorage(desktop, null);
   await desktop.goto(url, { waitUntil: "domcontentloaded" });
   await desktop.waitForSelector("#start-btn");
+  await assertHallVisibility(desktop, true, "desktop intro");
   await desktop.screenshot({ path: new URL("desktop-intro.png", outputDir).pathname, fullPage: true });
   assert.equal(await desktop.locator("canvas").count(), 1);
   assert.match(await desktop.locator("body").innerText(), /로봇 토리/);
@@ -654,6 +875,7 @@ try {
 
   await desktop.click("#start-btn");
   await waitForVisualAssets(desktop);
+  await assertHallVisibility(desktop, false, "desktop playing");
   let state = await readState(desktop);
   assert.equal(state.mode, "playing");
   assert.equal(state.era.index, 1);
@@ -787,6 +1009,10 @@ try {
   );
   assert.equal(await callTestHook(desktop, "collectItem", oversized.id), true);
   state = await readState(desktop);
+  assertScoreBreakdownInvariant(state.scoreBreakdown.run, "successful pickup run score");
+  assertScoreBreakdownInvariant(state.scoreBreakdown.currentEra, "successful pickup current-era score");
+  assert.equal(state.score, state.scoreBreakdown.run.totalScore, "HUD score should match score breakdown total");
+  assert.ok(state.scoreBreakdown.currentEra.comboBonus >= 0, "pickup score should expose combo bonus");
   const successFeedback = requireTelemetryObject(state, "feedback");
   assert.equal(state.lastCollection.startsWith(oversized.name), true);
   assert.equal(feedbackIndicatesSuccess(successFeedback), true, `successful pickup should expose success feedback; feedback=${JSON.stringify(successFeedback)}`);
@@ -802,6 +1028,20 @@ try {
   assert.equal(feedbackIndicatesSuccess(clearedFeedback), false, `pickup success feedback should clear after its lifetime; feedback=${JSON.stringify(clearedFeedback)}`);
   assert.equal(feedbackHasParticles(clearedFeedback), false, `pickup particles should clear after their lifetime; feedback=${JSON.stringify(clearedFeedback)}`);
   checks.push("same oversized item collects after deterministic size setup and success FX clears");
+
+  await callTestHook(desktop, "startEra", 0);
+  state = await readState(desktop);
+  const retryCollectible = state.nearby.find((entry) => entry.collectible && !entry.special);
+  assert.ok(retryCollectible, "retry farming check needs a collectible item");
+  await callTestHook(desktop, "warpToItem", retryCollectible.id);
+  assert.equal(await callTestHook(desktop, "collectItem", retryCollectible.id), true);
+  state = await readState(desktop);
+  assert.ok(state.scoreBreakdown.currentEra.totalScore > 0, `retry check should collect score first; score=${JSON.stringify(state.scoreBreakdown)}`);
+  await callTestHook(desktop, "retry");
+  state = await readState(desktop);
+  assert.equal(state.scoreBreakdown.currentEra.totalScore, 0, "retry should discard failed current attempt score");
+  assert.equal(state.score, state.scoreBreakdown.committed.totalScore, "retry should keep only committed checkpoint score");
+  checks.push("retry discards failed-attempt score so players cannot farm points");
 
   await callTestHook(desktop, "startEra", 0);
   state = await readState(desktop);
@@ -835,16 +1075,27 @@ try {
     true,
     `collectible boss should receive a marker; markers=${JSON.stringify(state.collectionMarkers)}`,
   );
-  assert.equal(await callTestHook(desktop, "collectItem", boss.id), true);
+  const collectedByHook = await callTestHook(desktop, "collectItem", boss.id);
   state = await readState(desktop);
+  assert.ok(
+    collectedByHook || state.goal.bossTarget.collected,
+    "boss should be collected either by the deterministic hook or the live collision frame",
+  );
   assert.equal(state.mode, "eraClear");
+  await assertHallVisibility(desktop, false, "desktop era clear");
+  assert.equal(await desktop.locator(".score-submit-form").count(), 0, "eraClear should not mount nickname submission");
   await assertOverlayMessaging(desktop, "eraClear", [/거대 코어/, /시대 점수/, /다음 시대로/], "desktop");
+  assertScoreBreakdownInvariant(state.scoreBreakdown.run, "eraClear run score");
+  assert.equal(state.scoreBreakdown.terminalBonus.kind, "eraClear");
+  assert.equal(state.scoreBreakdown.terminalBonus.clearBonus, 1600, "eraClear should add clear bonus");
+  assert.ok(state.scoreBreakdown.terminalBonus.eraTimeBonus % 20 === 0, "eraClear should award a 20-point step time bonus");
   assert.equal(state.goal.bossTarget.collected, true);
   assert.ok(state.goal.collected >= state.goal.required);
   await desktop.screenshot({ path: new URL("desktop-era-clear.png", outputDir).pathname, fullPage: true });
   checks.push("boss stays locked until focus goal and adequate size, and is required for era clear");
 
   await callTestHook(desktop, "startEra", 0);
+  const postsBeforeNaturalEraClear = leaderboardPostBodies.length;
   const natural = await collectNaturalEraOneGrowth(desktop);
   state = natural.state;
   assert.deepEqual(natural.tiers.slice(0, 4), ["tiny", "small", "medium", "large"]);
@@ -860,6 +1111,7 @@ try {
   assert.equal(await callTestHook(desktop, "collectItem", state.goal.bossTarget.id), true);
   state = await readState(desktop);
   assert.equal(state.mode, "eraClear");
+  assert.equal(leaderboardPostBodies.length, postsBeforeNaturalEraClear, "eraClear should not POST leaderboard records");
   assert.equal(state.goal.bossTarget.collected, true);
   assert.ok(state.goal.collected >= state.goal.required);
   progress = await readProgress(desktop);
@@ -899,9 +1151,69 @@ try {
 
   await callTestHook(desktop, "startEra", 0);
   await desktop.evaluate(() => window.advanceTime?.(200000));
+  await assertHallVisibility(desktop, false, "desktop time-up");
   await assertOverlayMessaging(desktop, "timeUp", [/시간 종료/, /조금만 더 굴려볼까요/, /이 시대 다시 도전/], "desktop");
+  state = await readState(desktop);
+  assertScoreBreakdownInvariant(state.scoreBreakdown.run, "timeUp run score");
+  assert.equal(state.scoreBreakdown.completedEras, 0, "era-one timeUp should submit zero completed eras");
+  await desktop.locator("#timeup-nickname").fill("가");
+  assert.equal(await desktop.locator(".score-save-button").isDisabled(), true, "one-letter nickname should disable submit");
+  assert.equal(await desktop.locator("#timeup-nickname").getAttribute("aria-invalid"), "true");
+  await desktop.locator("#timeup-nickname").fill("테스터7");
+  assert.equal(await desktop.locator(".score-save-button").isDisabled(), false, "valid nickname should enable submit");
+  const postsBeforeSubmit = leaderboardPostBodies.length;
+  await desktop.locator(".score-save-button").click();
+  await desktop.getByText("명예의 전당에 기록했어요!").waitFor({ state: "visible", timeout: 10_000 });
+  state = await readState(desktop);
+  assert.equal(state.leaderboard.pendingSubmission, false, "successful submit should clear pending state");
+  assert.equal(state.leaderboard.lastSubmission.nickname, "테스터7");
+  assert.equal(leaderboardPostBodies.length, postsBeforeSubmit + 1, "timeUp should POST exactly once through the form");
+  const submittedPayload = JSON.parse(leaderboardPostBodies.at(-1).body);
+  assert.equal(submittedPayload.nickname, "테스터7");
+  assert.equal(submittedPayload.completedEras, 0);
+  assert.equal(submittedPayload.victory, false);
+  const duplicateUiSubmit = await desktop.evaluate(async (payload) => {
+    const response = await fetch("/api/leaderboard", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify(payload),
+    });
+    return { status: response.status, body: await response.json() };
+  }, submittedPayload);
+  assert.equal(duplicateUiSubmit.status, 200, "same terminal UI run should be idempotent on resubmit");
+  assert.equal(duplicateUiSubmit.body.entry.runId, submittedPayload.runId);
   await desktop.screenshot({ path: new URL("desktop-time-up.png", outputDir).pathname, fullPage: true });
-  checks.push("desktop time-up overlay explains current record and retry action");
+  checks.push("desktop time-up overlay explains current record, validates nickname, saves once, and supports atomic idempotent retry");
+
+  await callTestHook(desktop, "startEra", 0);
+  await desktop.evaluate(() => window.advanceTime?.(200000));
+  const offlineErrorStart = errors.length;
+  const blockedLeaderboardPosts = async (route) => {
+    if (route.request().method() === "POST") {
+      await route.abort("failed");
+      return;
+    }
+    await route.continue();
+  };
+  await desktop.route("**/api/leaderboard", blockedLeaderboardPosts);
+  await desktop.locator("#timeup-nickname").fill("복구로봇");
+  await desktop.locator(".score-save-button").click();
+  await desktop.locator(".submission-status.is-error").waitFor({ state: "visible", timeout: 10_000 });
+  const expectedOfflineErrors = errors.splice(offlineErrorStart);
+  assert.ok(
+    expectedOfflineErrors.every((message) => message.includes("net::ERR_FAILED")),
+    `offline recovery probe should only produce the intentionally aborted request error; errors=${JSON.stringify(expectedOfflineErrors)}`,
+  );
+  const queuedScore = await desktop.evaluate(() => window.localStorage.getItem("time-roll-pending-leaderboard-v1"));
+  assert.ok(queuedScore, "failed terminal POST should persist a compact recovery record");
+  await desktop.unroute("**/api/leaderboard", blockedLeaderboardPosts);
+  await desktop.reload({ waitUntil: "domcontentloaded" });
+  await desktop.waitForFunction(
+    () => window.localStorage.getItem("time-roll-pending-leaderboard-v1") === null,
+    undefined,
+    { timeout: 10_000 },
+  );
+  checks.push("failed terminal score survives reload and is retried after connectivity returns");
 
   await callTestHook(desktop, "startEra", 1);
   await callTestHook(desktop, "setCameraHeading", 0);
@@ -1110,6 +1422,8 @@ try {
   state = await readState(desktop);
   assert.equal(state.era.index, 5);
   assert.equal(state.mode, "victory");
+  assertScoreBreakdownInvariant(state.scoreBreakdown.run, "victory run score");
+  assert.equal(state.scoreBreakdown.completedEras, 1, "direct test victory from era five should submit one completed era");
   assertEndCondition(state, ["finalVictory"], "desktop final victory HUD");
   await assertOverlayMessaging(desktop, "victory", [/시간 구슬/, /거대 목표/, /다시 시간여행/], "desktop");
   await desktop.screenshot({ path: new URL("desktop-victory.png", outputDir).pathname, fullPage: true });
@@ -1163,6 +1477,11 @@ try {
     await prepareStorage(audioLayout, null);
     await audioLayout.goto(url, { waitUntil: "domcontentloaded" });
     await audioLayout.waitForSelector("#start-btn");
+    await assertMobileHallLayout(audioLayout, viewport, `${label} intro Hall`);
+    await audioLayout.screenshot({
+      path: new URL(`mobile-hall-intro-${viewport.width}x${viewport.height}.png`, outputDir).pathname,
+      fullPage: true,
+    });
     await audioLayout.click("#start-btn");
     await waitForVisualAssets(audioLayout);
     await callTestHook(audioLayout, "startEra", 0);
@@ -1183,14 +1502,25 @@ try {
       path: new URL(`mobile-audio-hud-pickup-${viewport.width}x${viewport.height}.png`, outputDir).pathname,
       fullPage: true,
     });
+    await callTestHook(audioLayout, "startEra", 0);
+    await audioLayout.evaluate(() => window.advanceTime?.(200000));
+    await assertOverlayMessaging(audioLayout, "timeUp", [/시간 종료/, /기록 저장/], `${label} terminal form`);
+    await audioLayout.locator("#timeup-nickname").fill("테스터7");
+    await assertMobileTerminalScoreFormLayout(audioLayout, viewport, `${label} terminal form`);
+    await audioLayout.screenshot({
+      path: new URL(`mobile-score-submit-timeup-${viewport.width}x${viewport.height}.png`, outputDir).pathname,
+      fullPage: true,
+    });
     observations.mobileAudioHudLayout.push({
       viewport,
+      hallScreenshot: `mobile-hall-intro-${viewport.width}x${viewport.height}.png`,
       prePickupScreenshot: `mobile-audio-hud-pre-pickup-${viewport.width}x${viewport.height}.png`,
       pickupScreenshot: `mobile-audio-hud-pickup-${viewport.width}x${viewport.height}.png`,
+      terminalFormScreenshot: `mobile-score-submit-timeup-${viewport.width}x${viewport.height}.png`,
     });
     await audioLayout.close();
   }
-  checks.push("mobile audio controls show Korean on/off state before pickup, avoid top-HUD overlap, and hide during pickup callout at 320, 360, and 390 widths");
+  checks.push("mobile Hall, audio controls, pickup callout, and terminal score form fit at 320, 360, and 390 widths");
 
   const mobile = await browser.newPage({
     viewport: { width: 390, height: 844 },

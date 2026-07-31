@@ -29,6 +29,21 @@ import {
   type TimeRollProgress,
 } from "./timeRollProgress";
 import {
+  TIME_ROLL_SCORE_VERSION,
+  calculatePickupScore,
+  createScoreBreakdown,
+  mergeScoreBreakdowns,
+  timeBonusFor as calculateTimeBonus,
+  type ScoreBreakdown,
+} from "./timeRollScore";
+import {
+  enqueuePendingLeaderboardSubmission,
+  loadPendingLeaderboardSubmissions,
+  removePendingLeaderboardSubmission,
+  validateNickname,
+  type LeaderboardSubmitPayload,
+} from "./timeRollLeaderboard";
+import {
   makeCapsule,
   makeDish,
   makeRoundedBox,
@@ -146,6 +161,29 @@ type EndConditionSnapshot = {
   summary: string;
 };
 
+type LeaderboardEntry = {
+  rank: number;
+  runId: string;
+  nickname: string;
+  totalScore: number;
+  completedEras: number;
+  reachedEra: number;
+  maxCombo: number;
+  victory: boolean;
+};
+
+type LeaderboardStatus = "loading" | "ready" | "error";
+type SubmissionStatus = "idle" | "submitting" | "success" | "error";
+
+type LeaderboardSnapshot = {
+  status: LeaderboardStatus;
+  records: LeaderboardEntry[];
+  error: string;
+  pendingSubmission: boolean;
+  lastSubmission: LeaderboardEntry | null;
+  visible?: boolean;
+};
+
 type GameState = {
   mode: GameMode;
   era: number;
@@ -188,6 +226,12 @@ type GameState = {
   lastCollection: string;
   blockedCollision: string;
   pickupFeedback: PickupFeedback | null;
+  scoreBreakdown: ScoreBreakdown;
+  eraScoreBreakdown: ScoreBreakdown;
+  completedEras: number;
+  startedEra: number;
+  clientRunId: string;
+  runStartedAt: number;
 };
 
 type HudSnapshot = {
@@ -222,6 +266,11 @@ type HudSnapshot = {
   endCondition: EndConditionSnapshot;
   bestEra: number;
   bestSize: number;
+  scoreBreakdown: ScoreBreakdown;
+  eraScoreBreakdown: ScoreBreakdown;
+  completedEras: number;
+  startedEra: number;
+  clientRunId: string;
 };
 
 type GameActions = {
@@ -288,6 +337,8 @@ declare global {
       setCameraPose: (eye: Vec3, target: Vec3, fovDegrees?: number) => void;
       setPlayerPosition: (x: number, z: number) => void;
       setTimer: (seconds: number) => void;
+      getLeaderboardState: () => LeaderboardSnapshot;
+      setNickname: (nickname: string) => void;
       getState: () => string;
     };
   }
@@ -1757,12 +1808,43 @@ function collectionMultiplier(item: Collectible, focus: ThemeId) {
   return item.theme === focus ? 1.15 : 0.9;
 }
 
-function scoreForItem(item: Collectible, state: GameState) {
+function emptyScoreBreakdown(): ScoreBreakdown {
+  return createScoreBreakdown();
+}
+
+function addScoreBreakdowns(...parts: ScoreBreakdown[]): ScoreBreakdown {
+  return mergeScoreBreakdowns(...parts);
+}
+
+function cloneScoreBreakdown(score: ScoreBreakdown): ScoreBreakdown {
+  return { ...score };
+}
+
+function makeClientRunId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `run-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function scoreForItem(item: Collectible, state: GameState): ScoreBreakdown {
   const era = ERAS[state.era];
-  const sizePoints = Math.round((item.r / era.baseRadius) * 900);
-  const focusBonus = item.theme === era.focus ? 120 : 45;
-  const specialBonus = item.special ? 1600 : 0;
-  return Math.round((sizePoints + focusBonus + specialBonus) * (1 + Math.min(state.combo, 8) * 0.12));
+  const pickupScore = calculatePickupScore({
+    sizeRatio: item.r / era.baseRadius,
+    isFocus: item.theme === era.focus,
+    special: !!item.special,
+    combo: state.combo,
+  });
+  return createScoreBreakdown({
+    collectionScore: pickupScore.collectionScore,
+    comboBonus: pickupScore.comboBonus,
+    timeBonus: 0,
+    clearBonus: pickupScore.clearBonus,
+  });
+}
+
+function timeBonusFor(seconds: number): ScoreBreakdown {
+  return createScoreBreakdown({ timeBonus: calculateTimeBonus(seconds) });
 }
 
 function rankFor(eraScore: number, maxCombo: number, bossCollected: boolean) {
@@ -1960,6 +2042,12 @@ function createState(
     lastCollection: "",
     blockedCollision: "",
     pickupFeedback: null,
+    scoreBreakdown: emptyScoreBreakdown(),
+    eraScoreBreakdown: emptyScoreBreakdown(),
+    completedEras: 0,
+    startedEra: eraIndex,
+    clientRunId: "",
+    runStartedAt: 0,
   };
 }
 
@@ -2055,6 +2143,11 @@ function makeHud(state: GameState, bestEra: number, bestSize: number): HudSnapsh
     endCondition: getEndCondition(state, bossName),
     bestEra,
     bestSize,
+    scoreBreakdown: cloneScoreBreakdown(state.scoreBreakdown),
+    eraScoreBreakdown: cloneScoreBreakdown(state.eraScoreBreakdown),
+    completedEras: state.completedEras,
+    startedEra: state.startedEra,
+    clientRunId: state.clientRunId,
   };
 }
 
@@ -4202,6 +4295,207 @@ function loadProgress() {
   }
 }
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function normalizeLeaderboardEntry(value: unknown, index: number): LeaderboardEntry | null {
+  const record = asRecord(value);
+  if (!record || typeof record.nickname !== "string") return null;
+  const totalScore = Number(record.totalScore ?? record.score);
+  const completedEras = Number(record.completedEras ?? 0);
+  const reachedEra = Number(record.reachedEra ?? record.era ?? 1);
+  const maxCombo = Number(record.maxCombo ?? 0);
+  if (![totalScore, completedEras, reachedEra, maxCombo].every(Number.isFinite)) return null;
+  return {
+    rank: Math.max(1, Math.floor(Number(record.rank) || index + 1)),
+    runId: String(record.runId ?? record.id ?? `leader-${index + 1}`),
+    nickname: record.nickname,
+    totalScore: Math.max(0, Math.floor(totalScore)),
+    completedEras: clamp(Math.floor(completedEras), 0, ERAS.length),
+    reachedEra: clamp(Math.floor(reachedEra), 1, ERAS.length),
+    maxCombo: Math.max(0, Math.floor(maxCombo)),
+    victory: record.victory === true,
+  };
+}
+
+function normalizeLeaderboardPayload(payload: unknown): LeaderboardEntry[] {
+  const payloadRecord = asRecord(payload);
+  const values = Array.isArray(payload)
+    ? payload
+    : Array.isArray(payloadRecord?.records)
+      ? payloadRecord.records
+      : Array.isArray(payloadRecord?.entries)
+        ? payloadRecord.entries
+        : Array.isArray(payloadRecord?.leaders)
+          ? payloadRecord.leaders
+        : Array.isArray(payloadRecord?.leaderboard)
+          ? payloadRecord.leaderboard
+          : [];
+  return values
+    .map(normalizeLeaderboardEntry)
+    .filter((entry): entry is LeaderboardEntry => !!entry)
+    .sort((a, b) => (
+      b.completedEras - a.completedEras ||
+      b.totalScore - a.totalScore ||
+      b.maxCombo - a.maxCombo ||
+      a.rank - b.rank
+    ))
+    .slice(0, 10)
+    .map((entry, index) => ({ ...entry, rank: index + 1 }));
+}
+
+function nicknameValidationMessage(value: string) {
+  const result = validateNickname(value);
+  return result.ok ? "" : result.error.message;
+}
+
+function leaderboardEraLabel(entry: LeaderboardEntry) {
+  if (entry.victory) {
+    return entry.completedEras >= ERAS.length
+      ? "다섯 시대 완주"
+      : `${entry.completedEras}시대 이어서 완주`;
+  }
+  if (entry.completedEras === 0) return `${entry.reachedEra}시대 도전`;
+  return `${entry.completedEras}시대 완료`;
+}
+
+function ScoreBreakdownPanel({
+  score,
+  label,
+}: {
+  score: ScoreBreakdown;
+  label: string;
+}) {
+  const parts = [
+    ["수집", score.collectionScore],
+    ["콤보", score.comboBonus],
+    ["시간", score.timeBonus],
+    ["클리어", score.clearBonus],
+  ] as const;
+  return (
+    <section className="score-breakdown" aria-label={`${label} 점수 상세`}>
+      <div className="score-breakdown-head">
+        <span>{label}</span>
+        <strong>{score.totalScore.toLocaleString("ko-KR")}점</strong>
+      </div>
+      <div className="score-breakdown-parts">
+        {parts.map(([partLabel, value]) => (
+          <span key={partLabel}>
+            <b>{partLabel}</b>
+            <em>+{value.toLocaleString("ko-KR")}</em>
+          </span>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function HallOfFame({ snapshot }: { snapshot: LeaderboardSnapshot }) {
+  return (
+    <aside className="hall-plaque" aria-labelledby="hall-title" data-testid="hall-of-fame">
+      <div className="hall-heading">
+        <span className="hall-crown" aria-hidden="true">♛</span>
+        <div>
+          <h2 id="hall-title">명예의 전당</h2>
+          <p>별명 기반 친선 기록 · 완료 시대 우선</p>
+        </div>
+        <b>TOP 3</b>
+      </div>
+      {snapshot.status === "loading" ? (
+        <div className="hall-state" role="status">
+          <span className="hall-loader" aria-hidden="true" />
+          반짝이는 기록을 불러오는 중…
+        </div>
+      ) : snapshot.status === "error" ? (
+        <div className="hall-state is-error" role="status">{snapshot.error}</div>
+      ) : snapshot.records.length === 0 ? (
+        <div className="hall-state">첫 번째 전설의 주인공을 기다리고 있어요!</div>
+      ) : (
+        <ol className="hall-list" aria-label="명예의 전당 상위 3명">
+          {snapshot.records.slice(0, 3).map((entry, index) => (
+            <li className={index < 3 ? `is-medal is-rank-${index + 1}` : ""} key={entry.runId}>
+              <span className="hall-rank">{index + 1}</span>
+              <span className="hall-player">
+                <strong>{entry.nickname}</strong>
+                <small>{leaderboardEraLabel(entry)}</small>
+              </span>
+              <em>{entry.totalScore.toLocaleString("ko-KR")}</em>
+            </li>
+          ))}
+        </ol>
+      )}
+    </aside>
+  );
+}
+
+function ScoreSubmissionForm({
+  id,
+  nickname,
+  onNicknameChange,
+  onSubmit,
+  status,
+  message,
+}: {
+  id: string;
+  nickname: string;
+  onNicknameChange: (value: string) => void;
+  onSubmit: (event: React.FormEvent<HTMLFormElement>) => void;
+  status: SubmissionStatus;
+  message: string;
+}) {
+  const validationMessage = nicknameValidationMessage(nickname);
+  const busy = status === "submitting";
+  const saved = status === "success";
+  return (
+    <form className={`score-submit-form is-${status}`} onSubmit={onSubmit}>
+      {saved ? (
+        <div className="saved-record-badge" role="status">
+          <span aria-hidden="true">✓</span>
+          명예 기록 저장 완료
+        </div>
+      ) : null}
+      <div className="nickname-field">
+        <label htmlFor={id}>명예의 전당 별명</label>
+        <input
+          id={id}
+          name="nickname"
+          value={nickname}
+          maxLength={8}
+          inputMode="text"
+          autoComplete="off"
+          spellCheck={false}
+          readOnly={saved}
+          aria-invalid={nickname.length > 0 && !!validationMessage}
+          aria-describedby={`${id}-guide ${id}-status`}
+          placeholder="예: 데굴토리"
+          onChange={(event) => onNicknameChange(event.target.value)}
+        />
+      </div>
+      <button
+        type="submit"
+        className="score-save-button"
+        disabled={!!validationMessage || busy || saved}
+      >
+        <span aria-hidden="true">{saved ? "✓" : "★"}</span>
+        {busy ? "저장 중…" : saved ? "기록 완료" : "기록 저장"}
+      </button>
+      <p id={`${id}-guide`} className="nickname-guide">
+        2-8글자 별명만 써요. 이름, 학교, 반은 쓰지 마세요.
+      </p>
+      <p
+        id={`${id}-status`}
+        className={`submission-status is-${status}`}
+        role={status === "error" ? "alert" : "status"}
+        aria-live="polite"
+      >
+        {message || "별명만 저장하며 다른 개인정보는 받지 않아요."}
+      </p>
+    </form>
+  );
+}
+
 export default function TimeRollGame() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const gameRef = useRef<GameState | null>(null);
@@ -4220,6 +4514,19 @@ export default function TimeRollGame() {
   const [progressSnapshot, setProgressSnapshot] = useState<TimeRollProgress>(
     () => defaultProgress({ maxEraIndex: ERAS.length - 1 }),
   );
+  const [leaderboardSnapshot, setLeaderboardSnapshot] = useState<LeaderboardSnapshot>({
+    status: "loading",
+    records: [],
+    error: "",
+    pendingSubmission: false,
+    lastSubmission: null,
+  });
+  const leaderboardRef = useRef(leaderboardSnapshot);
+  const pendingFlushRef = useRef(false);
+  const [nickname, setNickname] = useState("");
+  const nicknameRef = useRef("");
+  const [submissionStatus, setSubmissionStatus] = useState<SubmissionStatus>("idle");
+  const [submissionMessage, setSubmissionMessage] = useState("");
   const [fullscreen, setFullscreen] = useState(false);
   const [joystickKnob, setJoystickKnob] = useState({ x: 0, y: 0 });
   const initialHud = useMemo<HudSnapshot>(
@@ -4267,11 +4574,108 @@ export default function TimeRollGame() {
       },
       bestEra: 0,
       bestSize: 0,
+      scoreBreakdown: emptyScoreBreakdown(),
+      eraScoreBreakdown: emptyScoreBreakdown(),
+      completedEras: 0,
+      startedEra: 0,
+      clientRunId: "",
     }),
     [],
   );
   const [hud, setHud] = useState(initialHud);
   const [fatalError, setFatalError] = useState("");
+
+  const refreshLeaderboard = useCallback(async () => {
+    setLeaderboardSnapshot((current) => ({
+      ...current,
+      status: "loading",
+      error: "",
+    }));
+    try {
+      const response = await fetch("/api/leaderboard?limit=10", {
+        headers: { Accept: "application/json" },
+        cache: "no-store",
+      });
+      if (!response.ok) throw new Error(`leaderboard ${response.status}`);
+      const payload: unknown = await response.json();
+      setLeaderboardSnapshot((current) => ({
+        ...current,
+        status: "ready",
+        records: normalizeLeaderboardPayload(payload),
+        error: "",
+      }));
+    } catch {
+      setLeaderboardSnapshot((current) => ({
+        ...current,
+        status: "error",
+        error: "기록을 불러오지 못했어요. 게임은 바로 시작할 수 있어요.",
+      }));
+    }
+  }, []);
+
+  useEffect(() => {
+    queueMicrotask(() => {
+      void refreshLeaderboard();
+    });
+  }, [refreshLeaderboard]);
+
+  const flushPendingSubmissions = useCallback(async () => {
+    if (pendingFlushRef.current) return;
+    const pending = loadPendingLeaderboardSubmissions(window.localStorage);
+    if (pending.length === 0) return;
+    pendingFlushRef.current = true;
+    setLeaderboardSnapshot((current) => ({
+      ...current,
+      pendingSubmission: true,
+    }));
+    let shouldRefresh = false;
+    try {
+      for (const payload of pending) {
+        try {
+          const response = await fetch("/api/leaderboard", {
+            method: "POST",
+            headers: {
+              Accept: "application/json",
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify(payload),
+          });
+          if (response.ok || response.status === 409) {
+            removePendingLeaderboardSubmission(window.localStorage, payload.runId);
+            shouldRefresh = shouldRefresh || response.ok;
+          }
+        } catch {
+          // Keep the compact pending record for the next online event or reload.
+        }
+      }
+    } finally {
+      pendingFlushRef.current = false;
+      setLeaderboardSnapshot((current) => ({
+        ...current,
+        pendingSubmission: false,
+      }));
+      if (shouldRefresh) void refreshLeaderboard();
+    }
+  }, [refreshLeaderboard]);
+
+  useEffect(() => {
+    queueMicrotask(() => {
+      void flushPendingSubmissions();
+    });
+    const retryWhenOnline = () => {
+      void flushPendingSubmissions();
+    };
+    window.addEventListener("online", retryWhenOnline);
+    return () => window.removeEventListener("online", retryWhenOnline);
+  }, [flushPendingSubmissions]);
+
+  useEffect(() => {
+    leaderboardRef.current = leaderboardSnapshot;
+  }, [leaderboardSnapshot]);
+
+  useEffect(() => {
+    nicknameRef.current = nickname;
+  }, [nickname]);
 
   const syncBgm = useCallback(() => {
     const audio = audioElementRef.current;
@@ -4379,6 +4783,32 @@ export default function TimeRollGame() {
     let lastTime = performance.now();
     let uiAccumulator = 0;
     let manualUntil = 0;
+    let committedScore = emptyScoreBreakdown();
+    let attemptScore = emptyScoreBreakdown();
+    let committedEras = 0;
+    let committedMaxCombo = 0;
+    let attemptMaxCombo = 0;
+    let checkpointThemeTotals: Record<ThemeId, number> = { ...EMPTY_TOTALS };
+    let checkpointTotalCollected = 0;
+
+    const syncRunScoreState = () => {
+      const total = addScoreBreakdowns(committedScore, attemptScore);
+      state.scoreBreakdown = total;
+      state.eraScoreBreakdown = cloneScoreBreakdown(attemptScore);
+      state.score = total.totalScore;
+      state.eraScore = attemptScore.totalScore;
+      state.maxCombo = Math.max(committedMaxCombo, attemptMaxCombo);
+    };
+
+    const resetSubmissionUi = () => {
+      setSubmissionStatus("idle");
+      setSubmissionMessage("");
+      setLeaderboardSnapshot((current) => ({
+        ...current,
+        pendingSubmission: false,
+        lastSubmission: null,
+      }));
+    };
 
     const persistProgress = () => {
       bestEra = Math.max(bestEra, state.era);
@@ -4404,8 +4834,8 @@ export default function TimeRollGame() {
         {
           era: state.era,
           score: state.eraScore,
-          maxCombo: state.maxCombo,
-          rank: rankFor(state.eraScore, state.maxCombo, true),
+          maxCombo: attemptMaxCombo,
+          rank: rankFor(state.eraScore, attemptMaxCombo, true),
           completed: true,
           size: state.radius,
           storyEndingSeen: state.era === ERAS.length - 1,
@@ -4449,15 +4879,33 @@ export default function TimeRollGame() {
       state.cameraKick = 0;
       state.bossReady = false;
       state.finalReady = false;
-      state.eraScore = 0;
       state.combo = 0;
       state.comboTimer = 0;
       state.lastCollection = "";
       state.blockedCollision = "";
       state.pickupFeedback = null;
+      syncRunScoreState();
       updateGrowthState(state);
       resetCamera(camera, state);
       syncHud(true);
+    };
+
+    const beginRun = (eraIndex: number) => {
+      committedScore = emptyScoreBreakdown();
+      attemptScore = emptyScoreBreakdown();
+      committedEras = 0;
+      committedMaxCombo = 0;
+      attemptMaxCombo = 0;
+      checkpointThemeTotals = { ...EMPTY_TOTALS };
+      checkpointTotalCollected = 0;
+      state.themeTotals = { ...EMPTY_TOTALS };
+      state.totalCollected = 0;
+      state.completedEras = 0;
+      state.startedEra = eraIndex;
+      state.clientRunId = makeClientRunId();
+      state.runStartedAt = performance.now();
+      resetSubmissionUi();
+      resetEra(eraIndex, "playing");
     };
 
     const collect = (item: Collectible) => {
@@ -4471,10 +4919,14 @@ export default function TimeRollGame() {
       }
       state.combo = state.comboTimer > 0 ? state.combo + 1 : 1;
       state.comboTimer = 2.4;
-      state.maxCombo = Math.max(state.maxCombo, state.combo);
-      const gainedScore = scoreForItem(item, state);
-      state.score += gainedScore;
-      state.eraScore += gainedScore;
+      attemptMaxCombo = Math.max(attemptMaxCombo, state.combo);
+      const pickupScore = scoreForItem(item, state);
+      attemptScore = addScoreBreakdowns(attemptScore, pickupScore);
+      if (item.special) {
+        attemptScore = addScoreBreakdowns(attemptScore, timeBonusFor(state.timer));
+      }
+      syncRunScoreState();
+      const gainedScore = pickupScore.totalScore;
       state.radius = absorbRadius(state, item, collectionMultiplier(item, ERAS[state.era].focus));
       updateGrowthState(state);
       state.pickupFeedback = {
@@ -4535,6 +4987,7 @@ export default function TimeRollGame() {
       }
       if (item.special) {
         const eraStory = getTimeRollEraStory(era.focus);
+        state.completedEras = committedEras + 1;
         if (state.era === ERAS.length - 1) {
           state.mode = "victory";
           state.message = TIME_ROLL_ENDING.title;
@@ -4689,6 +5142,7 @@ export default function TimeRollGame() {
       state.timer = Math.max(0, state.timer - safeDt);
       if (state.mode === "playing" && state.timer <= 0) {
         state.mode = "timeUp";
+        state.completedEras = committedEras;
         state.message = "시간 종료 · 완료 조건을 달성하기 전에 시간이 끝났어요";
         state.messageTime = 20;
         persistProgress();
@@ -4784,6 +5238,34 @@ export default function TimeRollGame() {
         combo: state.combo,
         maxCombo: state.maxCombo,
         eraScore: state.eraScore,
+        scoreBreakdown: {
+          run: cloneScoreBreakdown(state.scoreBreakdown),
+          currentEra: cloneScoreBreakdown(state.eraScoreBreakdown),
+          committed: cloneScoreBreakdown(committedScore),
+          completedEras: state.completedEras,
+          startedEra: state.startedEra + 1,
+          reachedEra: state.era + 1,
+          clientRunId: state.clientRunId,
+          terminalBonus: {
+            kind:
+              state.mode === "eraClear" || state.mode === "victory" || state.mode === "timeUp"
+                ? state.mode
+                : null,
+            eraTimeBonus: state.mode === "timeUp" ? 0 : state.eraScoreBreakdown.timeBonus,
+            clearBonus: state.mode === "timeUp" ? 0 : state.eraScoreBreakdown.clearBonus,
+            totalBonus:
+              state.mode === "timeUp"
+                ? 0
+                : state.eraScoreBreakdown.timeBonus + state.eraScoreBreakdown.clearBonus,
+          },
+        },
+        leaderboard: {
+          visible: state.mode === "intro",
+          status: leaderboardRef.current.status,
+          recordCount: leaderboardRef.current.records.length,
+          pendingSubmission: leaderboardRef.current.pendingSubmission,
+          lastSubmission: leaderboardRef.current.lastSubmission,
+        },
         timerSeconds: Number(state.timer.toFixed(1)),
         boost: Number(state.boost.toFixed(2)),
         reducedMotion: state.reducedMotion,
@@ -4899,7 +5381,7 @@ export default function TimeRollGame() {
     actionsRef.current = {
       start: (eraIndex = 0) => {
         const safeEra = clamp(Math.floor(eraIndex), 0, bestEra);
-        resetEra(safeEra, "playing");
+        beginRun(safeEra);
         setBgmIntent(true);
         playFx("start");
       },
@@ -4919,6 +5401,14 @@ export default function TimeRollGame() {
       },
       nextEra: () => {
         if (state.mode !== "eraClear") return;
+        committedScore = addScoreBreakdowns(committedScore, attemptScore);
+        attemptScore = emptyScoreBreakdown();
+        committedEras += 1;
+        committedMaxCombo = Math.max(committedMaxCombo, attemptMaxCombo);
+        attemptMaxCombo = 0;
+        checkpointThemeTotals = { ...state.themeTotals };
+        checkpointTotalCollected = state.totalCollected;
+        state.completedEras = committedEras;
         const next = Math.min(state.era + 1, ERAS.length - 1);
         bestEra = Math.max(bestEra, next);
         resetEra(next, "playing");
@@ -4927,18 +5417,19 @@ export default function TimeRollGame() {
         playFx("start");
       },
       retryEra: () => {
+        attemptScore = emptyScoreBreakdown();
+        attemptMaxCombo = 0;
+        state.themeTotals = { ...checkpointThemeTotals };
+        state.totalCollected = checkpointTotalCollected;
+        state.completedEras = committedEras;
+        state.clientRunId = makeClientRunId();
+        resetSubmissionUi();
         resetEra(state.era, "playing");
         setBgmIntent(true);
         playFx("start");
       },
       restart: () => {
-        state.themeTotals = { ...EMPTY_TOTALS };
-        state.totalCollected = 0;
-        state.score = 0;
-        state.maxCombo = 0;
-        state.combo = 0;
-        state.comboTimer = 0;
-        resetEra(0, "playing");
+        beginRun(0);
         setBgmIntent(true);
         playFx("start");
       },
@@ -5001,7 +5492,7 @@ export default function TimeRollGame() {
         start: () => actionsRef.current?.start(0),
         startEra: (index: number) => {
           bestEra = Math.max(bestEra, clamp(Math.floor(index), 0, ERAS.length - 1));
-          resetEra(clamp(Math.floor(index), 0, ERAS.length - 1), "playing");
+          beginRun(clamp(Math.floor(index), 0, ERAS.length - 1));
         },
         setRadiusRatio: (ratio: number) => {
           const era = ERAS[state.era];
@@ -5061,6 +5552,15 @@ export default function TimeRollGame() {
         setTimer: (seconds: number) => {
           state.timer = Math.max(0, Number(seconds) || 0);
           syncHud(true);
+        },
+        getLeaderboardState: () => ({
+          ...leaderboardRef.current,
+          visible: state.mode === "intro",
+        }),
+        setNickname: (value: string) => {
+          const nextNickname = String(value ?? "");
+          nicknameRef.current = nextNickname;
+          setNickname(nextNickname);
         },
         getState: getTextState,
       };
@@ -5192,6 +5692,99 @@ export default function TimeRollGame() {
       return next;
     });
   }, [persistAudioPreferences]);
+
+  const submitScore = useCallback(async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const state = gameRef.current;
+    if (!state || (state.mode !== "timeUp" && state.mode !== "victory")) return;
+    const nicknameResult = validateNickname(nicknameRef.current);
+    if (!nicknameResult.ok) {
+      setSubmissionStatus("error");
+      setSubmissionMessage(nicknameResult.error.message);
+      return;
+    }
+
+    const score = state.scoreBreakdown;
+    const payload: LeaderboardSubmitPayload = {
+      runId: state.clientRunId,
+      nickname: nicknameResult.payload.nickname,
+      scoreVersion: TIME_ROLL_SCORE_VERSION,
+      collectionScore: score.collectionScore,
+      comboBonus: score.comboBonus,
+      timeBonus: score.timeBonus,
+      clearBonus: score.clearBonus,
+      totalScore: score.totalScore,
+      maxCombo: state.maxCombo,
+      startedEra: state.startedEra + 1,
+      reachedEra: state.era + 1,
+      completedEras: state.completedEras,
+      victory: state.mode === "victory",
+    };
+
+    setSubmissionStatus("submitting");
+    setSubmissionMessage("기록을 안전하게 저장하고 있어요…");
+    setLeaderboardSnapshot((current) => ({
+      ...current,
+      pendingSubmission: true,
+    }));
+    enqueuePendingLeaderboardSubmission(window.localStorage, payload);
+    try {
+      const response = await fetch("/api/leaderboard", {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      });
+      const responsePayload: unknown = await response.json().catch(() => null);
+      if (!response.ok) {
+        const responseRecord = asRecord(responsePayload);
+        const errorRecord = asRecord(responseRecord?.error);
+        if (response.status === 409) {
+          removePendingLeaderboardSubmission(window.localStorage, payload.runId);
+        }
+        throw new Error(
+          typeof errorRecord?.message === "string"
+            ? errorRecord.message
+            : "기록을 저장하지 못했어요.",
+        );
+      }
+      const responseRecord = asRecord(responsePayload);
+      removePendingLeaderboardSubmission(window.localStorage, payload.runId);
+      const responseRank = Math.max(1, Math.floor(Number(responseRecord?.rank) || 1));
+      const submittedEntry = normalizeLeaderboardEntry(responseRecord?.entry, responseRank - 1);
+      setSubmissionStatus("success");
+      setSubmissionMessage("명예의 전당에 기록했어요!");
+      setLeaderboardSnapshot((current) => ({
+        ...current,
+        records: normalizeLeaderboardPayload(responsePayload),
+        pendingSubmission: false,
+        lastSubmission: submittedEntry,
+      }));
+      void refreshLeaderboard();
+    } catch (error) {
+      setSubmissionStatus("error");
+      setSubmissionMessage(
+        error instanceof Error
+          ? `${error.message} 다시 눌러도 게임 기록은 사라지지 않아요.`
+          : "기록을 저장하지 못했어요. 다시 눌러도 게임 기록은 사라지지 않아요.",
+      );
+      setLeaderboardSnapshot((current) => ({
+        ...current,
+        pendingSubmission: false,
+      }));
+    }
+  }, [refreshLeaderboard]);
+
+  const updateNickname = useCallback((value: string) => {
+    setNickname(value);
+    nicknameRef.current = value;
+    if (submissionStatus !== "idle") {
+      setSubmissionStatus("idle");
+      setSubmissionMessage("");
+    }
+  }, [submissionStatus]);
 
   const updateJoystickFromPointer = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
     const box = event.currentTarget.getBoundingClientRect();
@@ -5504,6 +6097,7 @@ export default function TimeRollGame() {
             </div>
             <p className="title-tip">{TIME_ROLL_INTRO_TEASER.tip}</p>
           </div>
+          <HallOfFame snapshot={leaderboardSnapshot} />
           <div className="era-rail" aria-label="시대 선택">
             {ERAS.map((entry, index) => {
               const record = progressSnapshot.eras[String(index)];
@@ -5560,6 +6154,8 @@ export default function TimeRollGame() {
               {eraStory.clearLines.join(" ")} 거대 코어 <strong>{hud.bossName}</strong> 수집 완료.
               시대 점수 {hud.eraScore.toLocaleString("ko-KR")}점 · 최고 콤보 {hud.maxCombo} · 랭크 {rankFor(hud.eraScore, hud.maxCombo, hud.bossCollected)}
             </p>
+            <ScoreBreakdownPanel score={hud.eraScoreBreakdown} label="이번 시대 점수" />
+            <p className="result-note">시간 보너스와 클리어 보너스까지 누적했어요. 다음 시대까지 같은 기록으로 이어집니다.</p>
             <button type="button" className="primary-button" onClick={() => actionsRef.current?.nextEra()}>
               <span>다음 시대로</span><b>→</b>
             </button>
@@ -5576,6 +6172,18 @@ export default function TimeRollGame() {
               완료 조건을 달성하기 전에 시간이 끝났어요. 조금만 더 굴려볼까요?
               {" "}{hud.endCondition.summary}.
             </p>
+            <ScoreBreakdownPanel score={hud.scoreBreakdown} label="이번 도전 기록" />
+            <p className="result-note">
+              완료한 시대 {hud.completedEras}개 · 최고 콤보 {hud.maxCombo}
+            </p>
+            <ScoreSubmissionForm
+              id="timeup-nickname"
+              nickname={nickname}
+              onNicknameChange={updateNickname}
+              onSubmit={submitScore}
+              status={submissionStatus}
+              message={submissionMessage}
+            />
             <button type="button" className="primary-button" onClick={() => actionsRef.current?.retryEra()}>
               <span>이 시대 다시 도전</span><b>↻</b>
             </button>
@@ -5609,6 +6217,18 @@ export default function TimeRollGame() {
                 </span>
               ))}
             </div>
+            <ScoreBreakdownPanel score={hud.scoreBreakdown} label="시간여행 총점" />
+            <p className="result-note">
+              이번 도전에서 {hud.completedEras}개 시대 완료 · 최고 콤보 {hud.maxCombo}
+            </p>
+            <ScoreSubmissionForm
+              id="victory-nickname"
+              nickname={nickname}
+              onNicknameChange={updateNickname}
+              onSubmit={submitScore}
+              status={submissionStatus}
+              message={submissionMessage}
+            />
             <button type="button" className="primary-button" onClick={() => actionsRef.current?.restart()}>
               <span>다시 시간여행</span><b>↻</b>
             </button>
