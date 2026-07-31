@@ -97,9 +97,16 @@ async function installAudioProbe(page) {
 }
 
 function findOversizedItem(state) {
-  const item = state.nearby
-    .filter((entry) => !entry.special && !entry.collectible)
-    .sort((a, b) => a.requiredRadius - b.requiredRadius)[0];
+  const baseRadius = state.player.radius / Math.max(state.player.growthRatio, 0.001);
+  const nextTierRequiredRadius = baseRadius * 0.27;
+  const candidates = state.nearby
+    .filter((entry) => !entry.special && !entry.collectible);
+  const item = (
+    candidates
+      .filter((entry) => entry.requiredRadius >= nextTierRequiredRadius)
+      .sort((a, b) => a.requiredRadius - b.requiredRadius)[0] ??
+    candidates.sort((a, b) => a.requiredRadius - b.requiredRadius)[0]
+  );
   assert.ok(item, `expected an oversized non-boss item near player; nearby=${JSON.stringify(state.nearby)}`);
   return item;
 }
@@ -847,6 +854,12 @@ try {
   await reducedMotion.keyboard.up("ArrowUp");
   reducedState = await readState(reducedMotion);
   assertRollingCue(reducedState, { active: false, reason: "reduced-motion" }, "reduced-motion movement");
+  await callTestHook(
+    reducedMotion,
+    "setPlayerPosition",
+    reducedState.player.x,
+    reducedState.player.z,
+  );
   const reducedPickup = reducedState.nearby.find((entry) => entry.collectible && !entry.special);
   assert.ok(reducedPickup, "reduced-motion pickup FX check needs a deterministic collectible");
   assert.equal(await callTestHook(reducedMotion, "collectItem", reducedPickup.id), true);
@@ -855,6 +868,7 @@ try {
   assert.equal(reducedFeedback.success, true, `reduced-motion pickup should still announce success; feedback=${JSON.stringify(reducedFeedback)}`);
   assert.equal(reducedFeedback.successFxActive, false, `reduced-motion pickup should suppress world FX telemetry; feedback=${JSON.stringify(reducedFeedback)}`);
   assert.equal(feedbackHasParticles(reducedFeedback), false, `reduced-motion pickup should suppress particles; feedback=${JSON.stringify(reducedFeedback)}`);
+  await reducedMotion.waitForFunction(() => document.body.innerText.includes("수집 성공!"));
   assert.match(await reducedMotion.locator("body").innerText(), /수집 성공!/, "reduced-motion pickup should keep visible success UI");
   checks.push("reduced-motion suppresses rolling cue and pickup world FX while keeping success UI");
   await reducedMotion.close();
@@ -1295,6 +1309,32 @@ try {
     state = await readState(desktop);
     assert.equal(state.era.index, eraIndex + 1);
     assert.ok(angleDistance(state.camera.heading, 0) <= 0.006);
+    const spawnLayout = requireTelemetryObject(state.objectField, "spawnLayout");
+    assert.equal(
+      spawnLayout.pairCount,
+      0,
+      `${eraLandmarkLabels[eraIndex]} collectible footprints should not overlap; layout=${JSON.stringify(spawnLayout)}`,
+    );
+    assert.equal(
+      spawnLayout.severePairCount,
+      0,
+      `${eraLandmarkLabels[eraIndex]} should have no small-inside-large placements; layout=${JSON.stringify(spawnLayout)}`,
+    );
+    assert.equal(
+      spawnLayout.protectedZoneIntrusions,
+      0,
+      `${eraLandmarkLabels[eraIndex]} collectibles should stay outside large structure footprints; layout=${JSON.stringify(spawnLayout)}`,
+    );
+    assert.equal(
+      spawnLayout.starterIntrusions,
+      0,
+      `${eraLandmarkLabels[eraIndex]} oversized collectibles should stay outside the tiny-object starter zone; layout=${JSON.stringify(spawnLayout)}`,
+    );
+    assert.equal(
+      spawnLayout.outOfBounds,
+      0,
+      `${eraLandmarkLabels[eraIndex]} non-boss collectibles should remain inside the playable arena; layout=${JSON.stringify(spawnLayout)}`,
+    );
     const screenshot = `era-landmark-${String(eraIndex + 1).padStart(2, "0")}.png`;
     const path = await captureCanvas(desktop, screenshot);
     eraLandmarkCards.push({ label: eraLandmarkLabels[eraIndex], path });
@@ -1304,6 +1344,7 @@ try {
       camera: state.camera,
       renderStats: state.renderStats,
       objectField: state.objectField,
+      spawnLayout,
       screenshot,
     });
   }
@@ -1322,7 +1363,7 @@ try {
     differences: eraLandmarkDifferences,
     contactSheet: "era-landmark-contact-sheet.png",
   };
-  checks.push("all five era landmarks render as distinct non-blank scenes");
+  checks.push("all five era item fields are overlap-free and landmarks render as distinct non-blank scenes");
 
   const eraSetPieceCards = [];
   const eraSetPieceStates = [];

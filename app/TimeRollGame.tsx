@@ -52,6 +52,14 @@ import {
   makeWheel,
 } from "./timeRollPremiumMeshes";
 import { KENNEY_FACTORY_MESHES } from "./timeRollCc0Meshes";
+import {
+  diagnosePlacement,
+  footprintRadius,
+  itemRenderScale,
+  protectedZonesForEra,
+  resolveItemSpawnOverlaps,
+  type PlacementOptions,
+} from "./timeRollPlacement";
 import { robotMeshYaw, segmentTransform } from "./timeRollVisualMath";
 
 type ThemeId = "manufacturing" | "construction" | "transport" | "communication" | "life";
@@ -448,6 +456,19 @@ const ERAS: Era[] = [
     sky: [0.51, 0.80, 0.91],
   },
 ];
+
+function placementOptionsForEra(eraIndex: number, seed = 20260730): PlacementOptions {
+  const era = ERAS[eraIndex];
+  return {
+    eraIndex,
+    era: {
+      baseRadius: era.baseRadius,
+      arenaUnits: era.arenaUnits,
+    },
+    focusTheme: era.focus,
+    seed,
+  };
+}
 
 const ITEM_NAMES: Record<ThemeId, string[][]> = {
   manufacturing: [
@@ -1990,7 +2011,7 @@ function generateItems(eraIndex: number, seed: number): Collectible[] {
     collected: false,
     special: true,
   });
-  return items;
+  return resolveItemSpawnOverlaps(items, placementOptionsForEra(eraIndex, seed));
 }
 
 function createState(
@@ -2695,6 +2716,28 @@ function drawEraImageGallery(
   });
 }
 
+function environmentPropIsClear(
+  state: GameState,
+  x: number,
+  z: number,
+  radius: number,
+) {
+  const options = placementOptionsForEra(state.era, state.seed);
+  const buffer = options.era.baseRadius * 0.1;
+  for (const zone of protectedZonesForEra(options)) {
+    if (Math.hypot(x - zone.x, z - zone.z) < radius + zone.radius + buffer) {
+      return false;
+    }
+  }
+  for (const item of state.items) {
+    const itemRadius = footprintRadius(item, options.focusTheme);
+    if (Math.hypot(x - item.x, z - item.z) < radius + itemRadius + buffer) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function drawEraEnvironment(
   renderer: WebGlToyRenderer,
   state: GameState,
@@ -2833,31 +2876,34 @@ function drawEraEnvironment(
     if (!state.lowQuality && index % 3 === 1) {
       const clusterSide = index % 2 === 0 ? -1 : 1;
       const cluster = rotateGroundPoint(x, z, yaw, clusterSide * base * 1.28, base * 0.08);
-      drawContactShadow(renderer, cluster[0], cluster[1], base * 0.42, 0.14, yaw);
-      const clusterMesh = clusterMeshForEra(state.era, index);
-      renderer.draw(
-        clusterMesh,
-        mixColor(focusColor, [1, 0.9, 0.42], 0.18),
-        [cluster[0], base * 0.36, cluster[1]],
-        [base * 0.52, base * 0.52, base * 0.52],
-        [0, yaw + index * 0.28, 0],
-        1,
-        0.58,
-        { skinTile: SKIN_BY_THEME[era.focus], textureBlend: 0.48, textureScale: 1.3 },
-      );
-      renderer.draw(
-        "capsule",
-        mixColor(focusColor, [0.12, 0.18, 0.2], 0.34),
-        [cluster[0] + Math.cos(index) * base * 0.32, base * 0.28, cluster[1] + Math.sin(index) * base * 0.32],
-        [base * 0.14, base * 0.5, base * 0.14],
-        [0, yaw, 0],
-        1,
-        0.42,
-        { skinTile: SKIN_BY_THEME[era.focus], textureBlend: 0.54 },
-      );
+      if (environmentPropIsClear(state, cluster[0], cluster[1], base * 0.56)) {
+        drawContactShadow(renderer, cluster[0], cluster[1], base * 0.42, 0.14, yaw);
+        const clusterMesh = clusterMeshForEra(state.era, index);
+        renderer.draw(
+          clusterMesh,
+          mixColor(focusColor, [1, 0.9, 0.42], 0.18),
+          [cluster[0], base * 0.36, cluster[1]],
+          [base * 0.52, base * 0.52, base * 0.52],
+          [0, yaw + index * 0.28, 0],
+          1,
+          0.58,
+          { skinTile: SKIN_BY_THEME[era.focus], textureBlend: 0.48, textureScale: 1.3 },
+        );
+        renderer.draw(
+          "capsule",
+          mixColor(focusColor, [0.12, 0.18, 0.2], 0.34),
+          [cluster[0] + Math.cos(index) * base * 0.32, base * 0.28, cluster[1] + Math.sin(index) * base * 0.32],
+          [base * 0.14, base * 0.5, base * 0.14],
+          [0, yaw, 0],
+          1,
+          0.42,
+          { skinTile: SKIN_BY_THEME[era.focus], textureBlend: 0.54 },
+        );
+      }
     }
     for (const railSide of [-1, 1]) {
       const railPoint = rotateGroundPoint(x, z, yaw, railSide * base * 0.82, 0);
+      if (!environmentPropIsClear(state, railPoint[0], railPoint[1], base * 0.82)) continue;
       renderer.draw(
         "cube",
         mixColor(focusColor, [0.12, 0.18, 0.2], 0.58),
@@ -2885,6 +2931,9 @@ function drawEraEnvironment(
         const postHeight = isBeacon ? base * 1.72 : base * 0.64;
         const postX = x + edgeX * side * base * 1.18;
         const postZ = z + edgeZ * side * base * 1.18;
+        if (!environmentPropIsClear(state, postX, postZ, isBeacon ? base * 0.42 : base * 0.24)) {
+          continue;
+        }
         if (!state.lowQuality) {
           drawContactShadow(renderer, postX, postZ, base * 0.22, 0.12, yaw);
         }
@@ -3059,12 +3108,15 @@ function drawEraEnvironment(
       if (Math.hypot(detailX, detailZ) < base * 4.2) continue;
       const detailSize = base * mix(0.09, 0.22, detailRandom());
       const detailShape = detailShapeForIndex(index);
+      const detailHeightScale = mix(0.65, 1.7, detailRandom());
+      const detailYaw = detailRandom() * Math.PI * 2;
+      if (!environmentPropIsClear(state, detailX, detailZ, detailSize * 0.72)) continue;
       renderer.draw(
         detailShape,
         mixColor(focusColor, groundEdge, 0.42 + (index % 3) * 0.09),
         [detailX, detailSize * 0.5, detailZ],
-        [detailSize, detailSize * mix(0.65, 1.7, detailRandom()), detailSize],
-        [0, detailRandom() * Math.PI * 2, 0],
+        [detailSize, detailSize * detailHeightScale, detailSize],
+        [0, detailYaw, 0],
         1,
         0.32,
         {
@@ -3082,6 +3134,7 @@ function drawEraEnvironment(
     const x = Math.cos(angle) * distance;
     const z = Math.sin(angle) * distance;
     const scale = base * mix(0.44, 0.82, random());
+    if (!environmentPropIsClear(state, x, z, scale * 0.94)) continue;
     if (state.era === 0 || state.era === 4) {
       if (index % 3 !== 0) {
         drawToyTree(renderer, x, z, scale, time, angle);
@@ -3110,12 +3163,16 @@ function drawEraEnvironment(
     const angle = (index / landmarkCount) * Math.PI * 2 + (random() - 0.5) * 0.16;
     const distanceBand = [0.78, 0.89, 0.98][index % 3];
     const distance = half * (distanceBand + random() * 0.025);
+    const landmarkX = Math.cos(angle) * distance;
+    const landmarkZ = Math.sin(angle) * distance;
+    const landmarkScale = base * mix(0.7, 1.18, random());
+    if (!environmentPropIsClear(state, landmarkX, landmarkZ, landmarkScale * 2.15)) continue;
     drawEraLandmark(
       renderer,
       state.era,
-      Math.cos(angle) * distance,
-      Math.sin(angle) * distance,
-      base * mix(0.7, 1.18, random()),
+      landmarkX,
+      landmarkZ,
+      landmarkScale,
       -angle + Math.PI / 2,
       time,
     );
@@ -3247,8 +3304,7 @@ function drawItem(
   const isFocus = item.theme === focusTheme;
   const variant = item.objectKind % OBJECT_VARIANTS_PER_THEME;
   const imageFamily = variant % OBJECT_GEOMETRY_FAMILY_COUNT;
-  const valueScale = 1 + (variant % 5) * 0.035 + (variant >= 5 ? 0.1 : 0);
-  const visualScale = (item.special ? 1.08 : isFocus ? 1.3 : 1.1) * valueScale;
+  const visualScale = itemRenderScale(item, focusTheme);
   const r = item.r * visualScale;
   const color = isFocus
     ? mixColor(theme.color, [1, 0.92, 0.7], 0.05)
@@ -5158,6 +5214,10 @@ export default function TimeRollGame() {
       const visibleCollectibleTelemetry = visibleCollectibles(state, camera, ERAS[state.era].baseRadius);
       const markerTargetTelemetry = markerTargets(state, visibleCollectibleTelemetry);
       const rollingCue = rollingCueSnapshot(state);
+      const placementDiagnostics = diagnosePlacement(
+        state.items,
+        placementOptionsForEra(state.era, state.seed),
+      );
       const nearby = state.items
         .filter((item) => !item.collected)
         .map((item) => ({
@@ -5281,6 +5341,18 @@ export default function TimeRollGame() {
             {} as Record<ThemeId, number>,
           ),
           variantKindsVisible: Array.from(new Set(state.items.filter((item) => !item.collected).map((item) => `${item.theme}:${item.objectKind}`))).sort(),
+          spawnLayout: {
+            pairCount: placementDiagnostics.pairCount,
+            severePairCount: placementDiagnostics.severePairCount,
+            protectedZoneIntrusions: placementDiagnostics.setPieceIntrusions,
+            starterIntrusions: placementDiagnostics.starterIntrusions,
+            outOfBounds: placementDiagnostics.outOfBounds,
+            minimumClearance: Number(placementDiagnostics.minimumClearance.toFixed(3)),
+            worstPairs: placementDiagnostics.worstPairs.map(({ a, b, clearance }) => ({
+              ids: [a.id, b.id],
+              clearance: Number(clearance.toFixed(3)),
+            })),
+          },
         },
         camera: {
           heading: Number(camera.heading.toFixed(3)),
