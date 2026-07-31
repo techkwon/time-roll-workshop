@@ -6,28 +6,37 @@ import type * as ProgressModule from "../app/timeRollProgress";
 const progressUrl = new URL("../app/timeRollProgress.ts", import.meta.url);
 const progress = await import(progressUrl.href) as typeof ProgressModule;
 
-test("defaults to a v2 replay-safe save shape", () => {
+test("defaults to a v3 replay-safe save shape", () => {
   assert.deepEqual(progress.defaultProgress(), {
-    version: 2,
+    version: 3,
     bestEra: 0,
     bestSize: 0,
     totalScore: 0,
     eras: {},
     storyEndingSeen: false,
-    soundEnabled: true,
+    bgmEnabled: true,
+    sfxEnabled: true,
   });
 });
 
-test("migrates v1 best era and size while adding v2 fields", () => {
+test("migrates v1 best era and size while adding v3 audio fields", () => {
   assert.deepEqual(progress.parseProgressJson(JSON.stringify({ bestEra: 3.8, bestSize: 42.5 }), { maxEraIndex: 4 }), {
-    version: 2,
+    version: 3,
     bestEra: 3,
     bestSize: 42.5,
     totalScore: 0,
     eras: {},
     storyEndingSeen: false,
-    soundEnabled: true,
+    bgmEnabled: true,
+    sfxEnabled: true,
   });
+});
+
+test("migrates v2 soundEnabled to both audio flags", () => {
+  assert.equal(progress.parseProgressJson(JSON.stringify({ version: 2, soundEnabled: true })).bgmEnabled, true);
+  assert.equal(progress.parseProgressJson(JSON.stringify({ version: 2, soundEnabled: true })).sfxEnabled, true);
+  assert.equal(progress.parseProgressJson(JSON.stringify({ version: 2, soundEnabled: false })).bgmEnabled, false);
+  assert.equal(progress.parseProgressJson(JSON.stringify({ version: 2, soundEnabled: false })).sfxEnabled, false);
 });
 
 test("malformed and unknown save payloads return defaults", () => {
@@ -36,10 +45,10 @@ test("malformed and unknown save payloads return defaults", () => {
   assert.deepEqual(progress.parseProgressJson(JSON.stringify({ version: 99, bestEra: 4 })), progress.defaultProgress());
 });
 
-test("normalizes v2 fields without trusting malformed values", () => {
+test("normalizes v3 fields without trusting malformed values", () => {
   const parsed = progress.parseProgressJson(
     JSON.stringify({
-      version: 2,
+      version: 3,
       bestEra: 12,
       bestSize: -10,
       totalScore: 999,
@@ -50,13 +59,14 @@ test("normalizes v2 fields without trusting malformed values", () => {
         broken: { bestScore: 999, maxCombo: 99, bestRank: "S", completed: true },
       },
       storyEndingSeen: "true",
-      soundEnabled: false,
+      bgmEnabled: false,
+      sfxEnabled: true,
     }),
     { maxEraIndex: 4 },
   );
 
   assert.deepEqual(parsed, {
-    version: 2,
+    version: 3,
     bestEra: 4,
     bestSize: 0,
     totalScore: 200,
@@ -65,7 +75,25 @@ test("normalizes v2 fields without trusting malformed values", () => {
       "2": { bestScore: 0, maxCombo: 0, bestRank: "B", completed: false },
     },
     storyEndingSeen: false,
-    soundEnabled: false,
+    bgmEnabled: false,
+    sfxEnabled: true,
+  });
+});
+
+test("keeps v3 bgm and sfx flags independent", () => {
+  assert.deepEqual(progress.parseProgressJson(JSON.stringify({
+    version: 3,
+    bgmEnabled: false,
+    sfxEnabled: true,
+  })), {
+    version: 3,
+    bestEra: 0,
+    bestSize: 0,
+    totalScore: 0,
+    eras: {},
+    storyEndingSeen: false,
+    bgmEnabled: false,
+    sfxEnabled: true,
   });
 });
 
@@ -102,16 +130,17 @@ test("records era results immutably with rank ordering S over A over B", () => {
 });
 
 test("resetProgress returns a fresh default object", () => {
-  const reset = progress.resetProgress({ defaultSoundEnabled: false });
+  const reset = progress.resetProgress({ defaultBgmEnabled: false, defaultSfxEnabled: true });
 
   assert.deepEqual(reset, {
-    version: 2,
+    version: 3,
     bestEra: 0,
     bestSize: 0,
     totalScore: 0,
     eras: {},
     storyEndingSeen: false,
-    soundEnabled: false,
+    bgmEnabled: false,
+    sfxEnabled: true,
   });
-  assert.notEqual(reset, progress.defaultProgress({ defaultSoundEnabled: false }));
+  assert.notEqual(reset, progress.defaultProgress({ defaultBgmEnabled: false, defaultSfxEnabled: true }));
 });

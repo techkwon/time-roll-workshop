@@ -5,6 +5,7 @@ import sharp from "sharp";
 
 const url = process.env.GAME_URL || "http://localhost:3000";
 const saveKey = "time-roll-workshop-v1";
+const bgmPath = "/audio/playful-chaos-hook.m4a";
 const outputDir = new URL("../output/e2e/", import.meta.url);
 const MOBILE_DRAW_CALL_CAP = 180;
 const MOBILE_TRANSPARENT_CALL_CAP = 35;
@@ -54,6 +55,11 @@ async function callTestHook(page, name, ...args) {
   );
 }
 
+async function expectPressed(page, accessibleName, expected) {
+  const pressed = await page.getByRole("button", { name: accessibleName }).getAttribute("aria-pressed");
+  assert.equal(pressed, String(expected), `${accessibleName} aria-pressed should be ${expected}`);
+}
+
 async function prepareStorage(page, value) {
   await page.addInitScript(
     ([key, storedValue]) => {
@@ -68,6 +74,24 @@ async function prepareStorage(page, value) {
     },
     [saveKey, value === null ? null : JSON.stringify(value)],
   );
+}
+
+async function installAudioProbe(page) {
+  await page.addInitScript(() => {
+    window.__audioProbe = { plays: 0, pauses: 0, lastSrc: "" };
+    const originalPlay = HTMLMediaElement.prototype.play;
+    const originalPause = HTMLMediaElement.prototype.pause;
+    HTMLMediaElement.prototype.play = function patchedPlay() {
+      window.__audioProbe.plays += 1;
+      window.__audioProbe.lastSrc = this.currentSrc || this.getAttribute("src") || "";
+      if (window.__timeRollUseNativePlay) return originalPlay.call(this);
+      return Promise.resolve();
+    };
+    HTMLMediaElement.prototype.pause = function patchedPause() {
+      window.__audioProbe.pauses += 1;
+      return originalPause.call(this);
+    };
+  });
 }
 
 function findOversizedItem(state) {
@@ -154,8 +178,55 @@ function requirePlayerRoll(state) {
   );
   const x = Number(roll.x);
   const z = Number(roll.z);
-  assert.ok(Number.isFinite(x) && Number.isFinite(z), `player.roll should expose numeric x/z values; roll=${JSON.stringify(roll)}`);
-  return { x, z };
+  const deltaX = Number(roll.deltaX);
+  const deltaZ = Number(roll.deltaZ);
+  assert.ok(
+    Number.isFinite(x) && Number.isFinite(z) && Number.isFinite(deltaX) && Number.isFinite(deltaZ),
+    `player.roll should expose numeric x/z and deltaX/deltaZ values; roll=${JSON.stringify(roll)}`,
+  );
+  return { x, z, deltaX, deltaZ };
+}
+
+function assertMarkerTelemetry(state, label) {
+  const markers = requireTelemetryObject(state, "collectionMarkers");
+  assert.equal(
+    markers.count,
+    markers.targetIds.length,
+    `${label} marker count should match targetIds; markers=${JSON.stringify(markers)}`,
+  );
+  assert.ok(
+    markers.count <= markers.maxTargets,
+    `${label} markers should respect target cap; markers=${JSON.stringify(markers)}`,
+  );
+  assert.ok(
+    Array.isArray(markers.visibleCollectibleIds),
+    `${label} markers should expose visible collectible ids; markers=${JSON.stringify(markers)}`,
+  );
+  const nearestVisibleCollectibleIds = markers.visibleCollectibleIds.slice(0, markers.maxTargets);
+  assert.deepEqual(
+    markers.targetIds,
+    nearestVisibleCollectibleIds,
+    `${label} markers should target only nearest visible collectible objects; markers=${JSON.stringify(markers)}`,
+  );
+  assert.equal(
+    markers.targets.every((entry) => entry.collectible === true),
+    true,
+    `${label} marker targets should all be collectible; markers=${JSON.stringify(markers)}`,
+  );
+  return markers;
+}
+
+function assertRollingCue(state, expected, label) {
+  const cue = requireTelemetryObject(state, "rollingCue");
+  assert.equal(cue.active, expected.active, `${label} rolling cue active mismatch; cue=${JSON.stringify(cue)}`);
+  if (expected.reason) {
+    assert.equal(cue.reason, expected.reason, `${label} rolling cue reason mismatch; cue=${JSON.stringify(cue)}`);
+  }
+  if (expected.active) {
+    assert.ok(cue.speed > 0, `${label} active cue should require real velocity; cue=${JSON.stringify(cue)}`);
+    assert.ok(cue.rollMagnitude > 0, `${label} active cue should require real roll delta; cue=${JSON.stringify(cue)}`);
+  }
+  return cue;
 }
 
 function feedbackIndicatesSuccess(feedback) {
@@ -233,6 +304,93 @@ async function assertPickupHasSingleLiveAnnouncement(page) {
     /수집 성공!/,
     "sr-only pickup copy should duplicate the pickup success text without being live",
   );
+}
+
+function rectsIntersect(a, b) {
+  return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+}
+
+async function readRequiredRect(page, selector, label) {
+  const rect = await page.locator(selector).first().evaluate((element) => {
+    const { left, top, right, bottom, width, height } = element.getBoundingClientRect();
+    return { left, top, right, bottom, width, height };
+  });
+  assert.ok(rect.width > 0 && rect.height > 0, `${label} should have visible dimensions; rect=${JSON.stringify(rect)}`);
+  return rect;
+}
+
+async function assertMobileAudioHudLayout(page, viewport, label) {
+  const bgmButton = page.getByRole("button", { name: "배경음악 끄기" });
+  const sfxButton = page.getByRole("button", { name: "효과음 끄기" });
+  await bgmButton.waitFor({ state: "visible" });
+  await sfxButton.waitFor({ state: "visible" });
+
+  assert.match(await bgmButton.innerText(), /음악\s*켬/, `${label} should show visible Korean BGM state`);
+  assert.match(await sfxButton.innerText(), /효과\s*켬/, `${label} should show visible Korean SFX state`);
+
+  const hudRect = await readRequiredRect(page, ".hud-actions", `${label} HUD actions`);
+  const hudTopRect = await readRequiredRect(page, ".hud-top", `${label} top HUD`);
+  const eraTitleRect = await readRequiredRect(page, ".era-card strong", `${label} era title`);
+  const sizeCardRect = await readRequiredRect(page, ".size-card", `${label} size card`);
+  const themeStripRect = await readRequiredRect(page, ".theme-strip", `${label} theme strip`);
+  assert.equal(Math.round(hudRect.left), viewport.width - 6 - 92, `${label} HUD actions should sit 6px from right`);
+  assert.equal(Math.round(hudRect.top), 202, `${label} HUD actions should sit below top HUD at 202px`);
+  assert.equal(Math.round(hudRect.width), 92, `${label} HUD actions should be a 2x2 44px target grid with one 4px gap`);
+  assert.equal(Math.round(hudRect.height), 92, `${label} HUD actions should be a 2x2 44px target grid with one 4px gap`);
+  assert.equal(Math.round(hudTopRect.left), 6, `${label} top HUD should reclaim the left safe margin`);
+  assert.equal(Math.round(hudTopRect.width), viewport.width - 12, `${label} top HUD should reclaim former control space`);
+  assert.ok(eraTitleRect.width >= Math.min(118, viewport.width * 0.36), `${label} era title should keep readable width; rect=${JSON.stringify(eraTitleRect)}`);
+  assert.ok(sizeCardRect.right <= viewport.width - 6 + 1, `${label} size card should remain inside the right edge; rect=${JSON.stringify(sizeCardRect)}`);
+  assert.ok(themeStripRect.right <= viewport.width - 6 + 1, `${label} theme strip should fit inside viewport; rect=${JSON.stringify(themeStripRect)}`);
+  assert.equal(
+    rectsIntersect(hudRect, hudTopRect),
+    false,
+    `${label} HUD actions should not intersect top HUD; hud=${JSON.stringify(hudRect)} top=${JSON.stringify(hudTopRect)}`,
+  );
+
+  for (const button of await page.locator(".hud-actions .icon-button").all()) {
+    const box = await button.boundingBox();
+    assert.ok(box, `${label} HUD action should have a bounding box`);
+    assert.ok(box.width >= 44 && box.height >= 44, `${label} HUD target should be at least 44x44; box=${JSON.stringify(box)}`);
+  }
+}
+
+async function assertMobilePickupHidesAudioHud(page, viewport, label) {
+  await page.locator(".pickup-callout[aria-hidden='true']").waitFor({ state: "visible" });
+  await page.locator(".game-message[role='status']").waitFor({ state: "visible" });
+  assert.equal(
+    await page.locator(".game-shell").getAttribute("data-pickup-feedback-active"),
+    "true",
+    `${label} shell should expose active pickup feedback state`,
+  );
+  assert.equal(
+    await page.locator(".hud-actions").isVisible(),
+    false,
+    `${label} HUD actions should be hidden while pickup callout is active`,
+  );
+  const hudStyle = await page.locator(".hud-actions").evaluate((element) => {
+    const style = window.getComputedStyle(element);
+    return {
+      visibility: style.visibility,
+      opacity: style.opacity,
+      pointerEvents: style.pointerEvents,
+    };
+  });
+  assert.deepEqual(
+    hudStyle,
+    { visibility: "hidden", opacity: "0", pointerEvents: "none" },
+    `${label} hidden HUD actions should not receive input; style=${JSON.stringify(hudStyle)}`,
+  );
+
+  const messageRect = await readRequiredRect(page, ".game-message[role='status']", `${label} game message`);
+  const calloutRect = await readRequiredRect(page, ".pickup-callout[aria-hidden='true']", `${label} pickup callout`);
+  assert.equal(Math.round(messageRect.left), 6, `${label} message should pin to the left safe margin`);
+  assert.ok(
+    messageRect.right <= viewport.width - 112 + 6 + 1,
+    `${label} message should reserve the right-side action grid; message=${JSON.stringify(messageRect)}`,
+  );
+  assert.ok(calloutRect.left >= 0 && calloutRect.right <= viewport.width, `${label} pickup callout should fit viewport; rect=${JSON.stringify(calloutRect)}`);
+  assert.match(await page.locator("body").innerText(), /수집 성공!/, `${label} pickup callout/message should show success text`);
 }
 
 async function captureCanvas(page, filename) {
@@ -377,34 +535,79 @@ async function buildContactSheet(cards, filename, columns, tileWidth = 480, tile
 try {
   const migration = await browser.newPage({ viewport: { width: 1280, height: 720 } });
   trackErrors(migration, "migration");
+  await installAudioProbe(migration);
   await prepareStorage(migration, { bestEra: 2.8, bestSize: 12.5 });
+  const bgmAsset = await migration.request.get(`${url}${bgmPath}`);
+  assert.equal(bgmAsset.status(), 200, "BGM asset should be served over HTTP");
+  assert.match(
+    bgmAsset.headers()["content-type"] ?? "",
+    /^(audio|video)\//,
+    `BGM asset should have an audio/video content type; headers=${JSON.stringify(bgmAsset.headers())}`,
+  );
   await migration.goto(url, { waitUntil: "domcontentloaded" });
   await migration.waitForSelector("#start-btn");
   await migration.waitForFunction(() => document.body.innerText.includes("이어서 굴리기"));
   assert.equal(await migration.getByRole("button", { name: "이어서 굴리기" }).isVisible(), true);
   assert.equal(await migration.locator(".era-node.is-unlocked").count(), 3);
+  let audioState = (await readState(migration)).audio;
+  assert.equal(audioState.bgmEnabled, true);
+  assert.equal(audioState.sfxEnabled, true);
+  assert.equal(audioState.bgmPlayingIntent, false, "intro should not request BGM autoplay");
+  assert.equal(audioState.trackSrc, bgmPath);
+  assert.equal(audioState.loop, true);
+  assert.equal(audioState.volume, 0.14);
+  assert.equal(await migration.evaluate(() => window.__audioProbe.plays), 0, "intro should not call audio.play");
   await migration.getByRole("button", { name: "이어서 굴리기" }).click();
   await migration.waitForFunction(() => window.render_game_to_text?.().includes("\"mode\":\"playing\""));
-  await migration.getByRole("button", { name: "소리 끄기" }).click();
+  await migration.waitForFunction(() => window.render_game_to_text && JSON.parse(window.render_game_to_text()).audio.bgmPlayingIntent === true);
+  audioState = (await readState(migration)).audio;
+  assert.equal(audioState.bgmPlayingIntent, true, "explicit start should request BGM playback");
+  assert.ok(await migration.evaluate(() => window.__audioProbe.plays) >= 1, "explicit start should call audio.play");
+  const sfxToggle = migration.getByRole("button", { name: "효과음 끄기" });
+  await expectPressed(migration, "효과음 끄기", true);
+  await sfxToggle.click();
   let progress = await readProgress(migration);
-  assert.equal(progress.version, 2);
+  assert.equal(progress.version, 3);
   assert.equal(progress.bestEra, 2);
   assert.equal(progress.bestSize, 12.5);
   assert.deepEqual(progress.eras, {});
-  assert.equal(progress.soundEnabled, false);
+  assert.equal(progress.bgmEnabled, true);
+  assert.equal(progress.sfxEnabled, false);
+  await migration.waitForFunction(() => !!document.querySelector('button[aria-label="효과음 켜기"]'));
+  await expectPressed(migration, "효과음 켜기", false);
+  audioState = (await readState(migration)).audio;
+  assert.equal(audioState.bgmEnabled, true, "SFX off should leave BGM enabled");
+  assert.equal(audioState.sfxEnabled, false);
+  await migration.getByRole("button", { name: "효과음 켜기" }).click();
+  await migration.waitForFunction(() => !!document.querySelector('button[aria-label="효과음 끄기"]'));
+  await expectPressed(migration, "효과음 끄기", true);
+  await migration.getByRole("button", { name: "배경음악 끄기" }).click();
+  await migration.waitForFunction(() => !!document.querySelector('button[aria-label="배경음악 켜기"]'));
+  await expectPressed(migration, "배경음악 켜기", false);
+  progress = await readProgress(migration);
+  assert.equal(progress.bgmEnabled, false);
+  assert.equal(progress.sfxEnabled, true);
+  audioState = (await readState(migration)).audio;
+  assert.equal(audioState.bgmEnabled, false);
+  assert.equal(audioState.sfxEnabled, true, "BGM off should leave SFX enabled");
+  assert.equal(audioState.bgmPlayingIntent, false);
   await migration.reload({ waitUntil: "domcontentloaded" });
   await migration.waitForSelector("#start-btn");
-  await migration.waitForFunction(() => !!document.querySelector('button[aria-label="소리 켜기"]'));
-  assert.equal(await migration.getByRole("button", { name: "소리 켜기" }).isVisible(), true);
+  await migration.waitForFunction(() => !!document.querySelector('button[aria-label="배경음악 켜기"]'));
+  assert.equal(await migration.getByRole("button", { name: "배경음악 켜기" }).isVisible(), true);
+  assert.equal(await migration.getByRole("button", { name: "효과음 끄기" }).isVisible(), true);
   progress = await readProgress(migration);
-  assert.equal(progress.soundEnabled, false);
+  assert.equal(progress.bgmEnabled, false);
+  assert.equal(progress.sfxEnabled, true);
   observations.migratedProgress = {
     version: progress.version,
     bestEra: progress.bestEra,
     bestSize: progress.bestSize,
-    soundEnabled: progress.soundEnabled,
+    bgmEnabled: progress.bgmEnabled,
+    sfxEnabled: progress.sfxEnabled,
+    bgmAssetContentType: bgmAsset.headers()["content-type"] ?? "",
   };
-  checks.push("v1 progress migrates to v2 and sound toggle survives reload");
+  checks.push("v1 progress migrates to v3 and independent audio toggles survive reload");
   await migration.close();
 
   const reducedMotion = await browser.newPage({ viewport: { width: 1280, height: 720 } });
@@ -417,6 +620,11 @@ try {
   await waitForVisualAssets(reducedMotion);
   let reducedState = await readState(reducedMotion);
   assert.equal(reducedState.reducedMotion, true);
+  await reducedMotion.keyboard.down("ArrowUp");
+  await reducedMotion.evaluate(() => window.advanceTime?.(500));
+  await reducedMotion.keyboard.up("ArrowUp");
+  reducedState = await readState(reducedMotion);
+  assertRollingCue(reducedState, { active: false, reason: "reduced-motion" }, "reduced-motion movement");
   const reducedPickup = reducedState.nearby.find((entry) => entry.collectible && !entry.special);
   assert.ok(reducedPickup, "reduced-motion pickup FX check needs a deterministic collectible");
   await callTestHook(reducedMotion, "setRadiusRatio", (reducedPickup.requiredRadius * 1.02) / (reducedState.player.radius / reducedState.player.growthRatio));
@@ -428,7 +636,7 @@ try {
   assert.equal(reducedFeedback.successFxActive, false, `reduced-motion pickup should suppress world FX telemetry; feedback=${JSON.stringify(reducedFeedback)}`);
   assert.equal(feedbackHasParticles(reducedFeedback), false, `reduced-motion pickup should suppress particles; feedback=${JSON.stringify(reducedFeedback)}`);
   assert.match(await reducedMotion.locator("body").innerText(), /수집 성공!/, "reduced-motion pickup should keep visible success UI");
-  checks.push("reduced-motion pickup keeps success UI but suppresses world FX telemetry");
+  checks.push("reduced-motion suppresses rolling cue and pickup world FX while keeping success UI");
   await reducedMotion.close();
 
   const desktop = await browser.newPage({ viewport: { width: 1280, height: 720 } });
@@ -451,6 +659,24 @@ try {
   assert.equal(state.era.index, 1);
   assert.equal(state.player.growthTier, "tiny");
   assert.ok(state.player.growthRatio < 0.2);
+  const openingMarkers = assertMarkerTelemetry(state, "desktop opening");
+  assert.equal(openingMarkers.maxTargets, 3);
+  assertRollingCue(state, { active: false, reason: "no-velocity" }, "desktop opening rest");
+  await desktop.keyboard.down("ArrowUp");
+  await desktop.evaluate(() => window.advanceTime?.(700));
+  await desktop.keyboard.up("ArrowUp");
+  state = await readState(desktop);
+  const movingCue = assertRollingCue(state, { active: true, reason: "moving" }, "desktop keyboard movement");
+  const movingRoll = requirePlayerRoll(state);
+  assert.ok(Math.hypot(movingRoll.deltaX, movingRoll.deltaZ) > 0, `desktop movement should expose roll deltas; roll=${JSON.stringify(movingRoll)}`);
+  await desktop.evaluate(() => window.advanceTime?.(1800));
+  state = await readState(desktop);
+  assertRollingCue(state, { active: false }, "desktop post-movement rest");
+  observations.rollingCue = {
+    desktopMoving: movingCue,
+    desktopRest: state.rollingCue,
+  };
+  checks.push("rolling cue activates only from real velocity plus roll deltas and clears at rest");
   await desktop.screenshot({ path: new URL("desktop-playing-start.png", outputDir).pathname, fullPage: true });
   let endCondition = assertEndCondition(state, ["collect"], "desktop opening HUD");
   assert.match(await desktop.locator("body").innerText(), /게임 종료 조건/, "desktop HUD should show the explicit end condition");
@@ -517,6 +743,11 @@ try {
   state = await readState(desktop);
   const blockedScoreBefore = state.score;
   const oversized = findOversizedItem(state);
+  assert.equal(
+    state.collectionMarkers.targetIds.includes(oversized.id),
+    false,
+    `oversized item should be excluded from collectible markers before growth; markers=${JSON.stringify(state.collectionMarkers)}`,
+  );
   assert.equal(await callTestHook(desktop, "warpToItem", oversized.id), true);
   assert.equal(await callTestHook(desktop, "collectItem", oversized.id), false);
   state = await readState(desktop);
@@ -547,6 +778,13 @@ try {
   checks.push("starts tiny and blocks an oversized item");
 
   await callTestHook(desktop, "setRadiusRatio", (oversized.requiredRadius * 1.02) / (state.player.radius / state.player.growthRatio));
+  state = await readState(desktop);
+  assertMarkerTelemetry(state, "desktop oversized after growth");
+  assert.equal(
+    state.collectionMarkers.targetIds.includes(oversized.id),
+    true,
+    `same oversized item should receive a marker once collectible; markers=${JSON.stringify(state.collectionMarkers)}`,
+  );
   assert.equal(await callTestHook(desktop, "collectItem", oversized.id), true);
   state = await readState(desktop);
   const successFeedback = requireTelemetryObject(state, "feedback");
@@ -576,15 +814,27 @@ try {
   assert.equal(state.mode, "playing");
   await callTestHook(desktop, "unlockBoss");
   await callTestHook(desktop, "setRadiusRatio", 0.2);
+  await callTestHook(desktop, "warpToItem", boss.id);
   state = await readState(desktop);
   assert.equal(state.goal.bossReady, true);
   assertEndCondition(state, ["boss"], "desktop boss HUD");
   assert.equal(state.goal.bossTarget.collectible, false);
+  assert.equal(
+    state.collectionMarkers.targetIds.includes(boss.id),
+    false,
+    `boss should not receive a marker until size rule allows collection; markers=${JSON.stringify(state.collectionMarkers)}`,
+  );
   assert.equal(await callTestHook(desktop, "collectItem", boss.id), false);
   assert.equal((await readState(desktop)).mode, "playing");
   await callTestHook(desktop, "setRadiusRatio", (state.goal.bossTarget.requiredRadius * 1.02) / (state.player.radius / state.player.growthRatio));
+  await callTestHook(desktop, "warpToItem", boss.id);
   state = await readState(desktop);
   assert.equal(state.goal.bossTarget.collectible, true);
+  assert.equal(
+    state.collectionMarkers.targetIds.includes(boss.id),
+    true,
+    `collectible boss should receive a marker; markers=${JSON.stringify(state.collectionMarkers)}`,
+  );
   assert.equal(await callTestHook(desktop, "collectItem", boss.id), true);
   state = await readState(desktop);
   assert.equal(state.mode, "eraClear");
@@ -613,7 +863,7 @@ try {
   assert.equal(state.goal.bossTarget.collected, true);
   assert.ok(state.goal.collected >= state.goal.required);
   progress = await readProgress(desktop);
-  assert.equal(progress.version, 2);
+  assert.equal(progress.version, 3);
   assert.equal(progress.bestEra, 1);
   assert.equal(progress.eras["0"].completed, true);
   assert.equal(progress.eras["0"].bestScore, state.eraScore);
@@ -637,7 +887,7 @@ try {
   progress = await readProgress(desktop);
   assert.equal(progress.bestEra, 1);
   assert.equal(progress.eras["0"].completed, true);
-  checks.push("v2 era clear records per-era bests and unlocks next era");
+  checks.push("v3 era clear records per-era bests and unlocks next era");
 
   await desktop.getByRole("button", { name: "게임 잠시 멈추기" }).click();
   state = await readState(desktop);
@@ -895,6 +1145,53 @@ try {
   observations.terminalTimeoutRegression = terminalTimeoutRegression;
   await desktop.close();
 
+  const mobileAudioViewports = [
+    { width: 320, height: 568 },
+    { width: 360, height: 800 },
+    { width: 390, height: 844 },
+  ];
+  observations.mobileAudioHudLayout = [];
+  for (const viewport of mobileAudioViewports) {
+    const label = `mobile audio HUD ${viewport.width}x${viewport.height}`;
+    const audioLayout = await browser.newPage({
+      viewport,
+      hasTouch: true,
+      isMobile: true,
+      deviceScaleFactor: 1,
+    });
+    trackErrors(audioLayout, label);
+    await prepareStorage(audioLayout, null);
+    await audioLayout.goto(url, { waitUntil: "domcontentloaded" });
+    await audioLayout.waitForSelector("#start-btn");
+    await audioLayout.click("#start-btn");
+    await waitForVisualAssets(audioLayout);
+    await callTestHook(audioLayout, "startEra", 0);
+    await callTestHook(audioLayout, "setRadiusRatio", 0.35);
+    await assertMobileAudioHudLayout(audioLayout, viewport, `${label} before pickup`);
+    await audioLayout.screenshot({
+      path: new URL(`mobile-audio-hud-pre-pickup-${viewport.width}x${viewport.height}.png`, outputDir).pathname,
+      fullPage: true,
+    });
+    state = await readState(audioLayout);
+    const layoutPickup = state.nearby.find((entry) => entry.collectible && !entry.special);
+    assert.ok(layoutPickup, `${label} needs a deterministic pickup to show game-message`);
+    await callTestHook(audioLayout, "warpToItem", layoutPickup.id);
+    assert.equal(await callTestHook(audioLayout, "collectItem", layoutPickup.id), true);
+    await audioLayout.evaluate(() => window.advanceTime?.(1000 / 60));
+    await assertMobilePickupHidesAudioHud(audioLayout, viewport, `${label} pickup`);
+    await audioLayout.screenshot({
+      path: new URL(`mobile-audio-hud-pickup-${viewport.width}x${viewport.height}.png`, outputDir).pathname,
+      fullPage: true,
+    });
+    observations.mobileAudioHudLayout.push({
+      viewport,
+      prePickupScreenshot: `mobile-audio-hud-pre-pickup-${viewport.width}x${viewport.height}.png`,
+      pickupScreenshot: `mobile-audio-hud-pickup-${viewport.width}x${viewport.height}.png`,
+    });
+    await audioLayout.close();
+  }
+  checks.push("mobile audio controls show Korean on/off state before pickup, avoid top-HUD overlap, and hide during pickup callout at 320, 360, and 390 widths");
+
   const mobile = await browser.newPage({
     viewport: { width: 390, height: 844 },
     hasTouch: true,
@@ -918,6 +1215,8 @@ try {
   await mobile.click("#start-btn");
   await waitForVisualAssets(mobile);
   const beforeJoystick = await readState(mobile);
+  const mobileOpeningMarkers = assertMarkerTelemetry(beforeJoystick, "mobile opening");
+  assert.equal(mobileOpeningMarkers.maxTargets, 1);
   await mobile.screenshot({ path: new URL("mobile-playing.png", outputDir).pathname, fullPage: true });
   observations.mobileRenderStats = {
     initial: beforeJoystick.renderStats,
@@ -934,6 +1233,8 @@ try {
   state = await readState(mobile);
   const moved = Math.hypot(state.player.x - beforeJoystick.player.x, state.player.z - beforeJoystick.player.z);
   assert.ok(moved > 0.1, `joystick should move player; moved=${moved}`);
+  assertRollingCue(state, { active: true, reason: "moving" }, "mobile joystick movement");
+  assertMarkerTelemetry(state, "mobile movement");
   observations.mobileRenderStats.moving = state.renderStats;
   assertMobileRenderBudget(state.renderStats, "mobile joystick movement");
   await mobile.screenshot({ path: new URL("mobile-moving.png", outputDir).pathname, fullPage: true });
@@ -951,6 +1252,7 @@ try {
   const mobileSuccessFeedback = requireTelemetryObject(state, "feedback");
   assert.equal(feedbackIndicatesSuccess(mobileSuccessFeedback), true, `mobile pickup should expose success feedback; feedback=${JSON.stringify(mobileSuccessFeedback)}`);
   assert.equal(feedbackHasParticles(mobileSuccessFeedback), true, `mobile pickup should expose pickup particles; feedback=${JSON.stringify(mobileSuccessFeedback)}`);
+  assertMarkerTelemetry(state, "mobile pickup success");
   observations.mobileRenderStats.pickupSuccess = state.renderStats;
   assertMobileRenderBudget(state.renderStats, "mobile pickup success FX");
   assert.match(await mobile.locator("body").innerText(), /수집 성공!/, "mobile should show a visible pickup success callout");

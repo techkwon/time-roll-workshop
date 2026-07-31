@@ -26,7 +26,7 @@ import {
   parseProgressJson,
   recordEraResult,
   serializeProgress,
-  type TimeRollProgressV2,
+  type TimeRollProgress,
 } from "./timeRollProgress";
 import {
   makeCapsule,
@@ -156,6 +156,8 @@ type GameState = {
   radius: number;
   rollX: number;
   rollZ: number;
+  rollDeltaX: number;
+  rollDeltaZ: number;
   timer: number;
   boost: number;
   items: Collectible[];
@@ -231,8 +233,30 @@ type GameActions = {
   setBoost: (active: boolean) => void;
 };
 
+type AudioFxName =
+  | "start"
+  | "pickup"
+  | "comboGrowth"
+  | "bossReady"
+  | "eraClear"
+  | "victory"
+  | "blocked"
+  | "timeUp";
+
+type AudioFxPattern = readonly [frequency: number, delay: number, duration: number];
 type Vec3 = [number, number, number];
 type Mat4 = Float32Array;
+
+const AUDIO_FX_PATTERNS: Record<AudioFxName, readonly AudioFxPattern[]> = {
+  start: [[420, 0, 0.07], [540, 0.07, 0.08], [660, 0.15, 0.1]],
+  pickup: [[520, 0, 0.07], [690, 0.055, 0.08]],
+  comboGrowth: [[560, 0, 0.08], [760, 0.07, 0.1], [920, 0.16, 0.1]],
+  bossReady: [[390, 0, 0.12], [520, 0.1, 0.12], [780, 0.21, 0.16]],
+  eraClear: [[620, 0, 0.12], [780, 0.11, 0.12], [980, 0.23, 0.2]],
+  victory: [[660, 0, 0.14], [880, 0.13, 0.16], [1040, 0.29, 0.24]],
+  blocked: [[210, 0, 0.08], [160, 0.075, 0.09]],
+  timeUp: [[360, 0, 0.11], [260, 0.1, 0.16], [210, 0.24, 0.2]],
+};
 
 type CameraState = {
   eye: Vec3;
@@ -413,6 +437,8 @@ const ITEM_NAMES: Record<ThemeId, string[][]> = {
 };
 
 const SAVE_KEY = "time-roll-workshop-v1";
+const BGM_SRC = "/audio/playful-chaos-hook.m4a";
+const BGM_VOLUME = 0.14;
 const EMPTY_TOTALS: Record<ThemeId, number> = {
   manufacturing: 0,
   construction: 0,
@@ -783,6 +809,20 @@ type VisibleCollectible = {
   drawShadow: boolean;
   priority: number;
   distance: number;
+};
+
+type MarkerTarget = {
+  item: Collectible;
+  distance: number;
+};
+
+type RollingCueSnapshot = {
+  active: boolean;
+  reason: "moving" | "reduced-motion" | "no-velocity" | "no-roll-delta";
+  speed: number;
+  rollDeltaX: number;
+  rollDeltaZ: number;
+  rollMagnitude: number;
 };
 
 function makePlane(): RawMesh {
@@ -1888,6 +1928,8 @@ function createState(
     radius: startingRadius(era.baseRadius),
     rollX: 0,
     rollZ: 0,
+    rollDeltaX: 0,
+    rollDeltaZ: 0,
     timer: era.seconds,
     boost: 1,
     items: generateItems(eraIndex, seed),
@@ -3702,6 +3744,72 @@ function drawRobot(
   }
 }
 
+function rollingCueSnapshot(state: GameState): RollingCueSnapshot {
+  const speed = Math.hypot(state.vx, state.vz);
+  const rollMagnitude = Math.hypot(state.rollDeltaX, state.rollDeltaZ);
+  let reason: RollingCueSnapshot["reason"] = "moving";
+  if (state.reducedMotion) {
+    reason = "reduced-motion";
+  } else if (speed <= ERAS[state.era].baseRadius * 0.025) {
+    reason = "no-velocity";
+  } else if (rollMagnitude <= 0.0008) {
+    reason = "no-roll-delta";
+  }
+  return {
+    active: reason === "moving",
+    reason,
+    speed,
+    rollDeltaX: state.rollDeltaX,
+    rollDeltaZ: state.rollDeltaZ,
+    rollMagnitude,
+  };
+}
+
+function markerTargets(state: GameState, visibleItems: VisibleCollectible[]): MarkerTarget[] {
+  const limit = state.lowQuality ? 1 : 3;
+  return visibleItems
+    .filter(({ item }) => !item.collected && canCollectByRule(state, item, state.bossReady))
+    .map(({ item, distance }) => ({ item, distance }))
+    .sort((a, b) => a.distance - b.distance)
+    .slice(0, limit);
+}
+
+function drawCollectionMarkers(
+  renderer: WebGlToyRenderer,
+  state: GameState,
+  targets: MarkerTarget[],
+  time: number,
+) {
+  const base = ERAS[state.era].baseRadius;
+  for (const { item } of targets) {
+    const bob = state.reducedMotion ? 0 : Math.sin(time * 2.6 + item.id * 0.37) * base * 0.055;
+    const arrowScale = Math.max(item.r * 2.25, base * (state.lowQuality ? 0.46 : 0.53));
+    const arrowY = Math.max(item.r * 3.7, base * 0.78) + bob;
+    const ivory: Vec3 = [1, 0.95, 0.74];
+    const teal = mixColor(THEME_BY_ID[item.theme].color, [0.03, 0.68, 0.74], 0.76);
+    renderer.draw(
+      "cone",
+      teal,
+      [item.x, arrowY, item.z],
+      [arrowScale * 0.38, arrowScale * 1.46, arrowScale * 0.38],
+      [Math.PI, item.yaw, 0],
+      1,
+      0.98,
+      { skinTile: 5, textureBlend: 0.34, textureScale: [1, 1.6] },
+    );
+    renderer.draw(
+      "torus",
+      ivory,
+      [item.x, arrowY + arrowScale * 0.72, item.z],
+      [arrowScale * 0.4, arrowScale * 0.4, arrowScale * 0.4],
+      [Math.PI / 2, item.yaw, 0],
+      1,
+      0.98,
+      { skinTile: 8, textureBlend: 0.32, textureScale: 1.25 },
+    );
+  }
+}
+
 function drawSpeedEffects(
   renderer: WebGlToyRenderer,
   state: GameState,
@@ -3788,7 +3896,9 @@ function drawPickupEffects(renderer: WebGlToyRenderer, state: GameState) {
 function drawBall(renderer: WebGlToyRenderer, state: GameState) {
   const r = state.radius;
   const halo = r;
-  drawContactShadow(renderer, state.x, state.z, r * 1.18, 0.36, state.rollZ * 0.2);
+  const rollingCue = rollingCueSnapshot(state);
+  const contactHeading = rollingCue.active ? Math.atan2(state.vx, -state.vz) : state.rollZ * 0.2;
+  drawContactShadow(renderer, state.x, state.z, r * 1.18, 0.36, contactHeading);
   renderer.draw(
     "sphere",
     [0.98, 0.66, 0.2],
@@ -3797,8 +3907,25 @@ function drawBall(renderer: WebGlToyRenderer, state: GameState) {
     [state.rollX, -state.rollZ * 0.34, state.rollZ],
     1,
     0.9,
-    { skinTile: 0, textureBlend: 0.18, textureScale: 1.02 },
+    {
+      skinTile: 0,
+      textureBlend: rollingCue.active ? 0.56 : 0.18,
+      textureScale: rollingCue.active ? [1.6, 0.64] : 1.02,
+    },
   );
+  if (rollingCue.active) {
+    const rollYaw = Math.atan2(rollingCue.rollDeltaZ, rollingCue.rollDeltaX);
+    renderer.draw(
+      "torus",
+      [0.52, 0.92, 0.88],
+      [state.x, r, state.z],
+      [halo * 1.9, halo * 1.9, halo * 1.9],
+      [Math.PI / 2 + state.rollX * 0.68, rollYaw + state.rollZ * 0.42, state.rollZ * 0.32],
+      1,
+      1,
+      { skinTile: 5, textureBlend: 0.46, textureScale: [1.55, 0.58] },
+    );
+  }
   if (state.growthRatio >= 0.24) {
     renderer.draw(
       "torus",
@@ -3827,33 +3954,58 @@ function drawBall(renderer: WebGlToyRenderer, state: GameState) {
     "sphere",
     [1.0, 0.8, 0.3],
     [state.x, r, state.z],
-    [r * 1.78, r * 1.78, r * 1.78],
-    [state.rollX * 0.72, state.rollZ * 0.48, state.rollZ * 0.72],
+    [r * (rollingCue.active ? 1.7 : 1.78), r * (rollingCue.active ? 1.7 : 1.78), r * (rollingCue.active ? 1.7 : 1.78)],
+    [
+      state.rollX * (rollingCue.active ? 1.06 : 0.72),
+      state.rollZ * (rollingCue.active ? 0.82 : 0.48),
+      state.rollZ * (rollingCue.active ? 1.08 : 0.72),
+    ],
     1,
     1,
+    {
+      skinTile: 5,
+      textureBlend: rollingCue.active ? 0.38 : 0.08,
+      textureScale: rollingCue.active ? [0.74, 1.72] : 1.08,
+    },
   );
   const nodeCount = state.lowQuality ? 4 : 6;
   for (let node = 0; node < nodeCount; node += 1) {
     const angle = (node / nodeCount) * Math.PI * 2 + state.rollZ * 0.88;
-    const wave = Math.sin(angle * 2 + state.rollX * 1.15) * halo * 0.14;
+    const rollingBoost = rollingCue.active ? 1 : 0;
+    const wave = Math.sin(angle * 2 + state.rollX * 1.15) * halo * (0.14 + rollingBoost * 0.08);
+    const nodeScale = halo * (0.085 + rollingBoost * (state.lowQuality ? 0.045 : 0.025));
+    const evenNode = node % 2 === 0;
+    let nodeColor: Vec3;
+    if (rollingCue.active && state.lowQuality) {
+      nodeColor = evenNode ? [1, 0.95, 0.58] : [0.04, 0.76, 0.92];
+    } else {
+      nodeColor = evenNode ? [1, 0.86, 0.3] : [0.24, 0.88, 0.94];
+    }
     renderer.draw(
       "sphere",
-      node % 2 === 0 ? [1, 0.86, 0.3] : [0.24, 0.88, 0.94],
+      nodeColor,
       [state.x + Math.cos(angle) * halo * 0.82, r + wave, state.z + Math.sin(angle) * halo * 0.82],
-      [halo * 0.085, halo * 0.085, halo * 0.085],
+      [nodeScale, nodeScale, nodeScale],
       [0, 0, 0],
       1,
-      0.72,
+      rollingCue.active ? 0.94 : 0.72,
     );
   }
+  const rollDotAngle = state.rollZ * 0.92 - state.rollX * 0.24 - 0.8;
+  const rollDotLift = Math.sin(state.rollX * 0.86 + state.rollZ * 0.28 + 0.45);
   renderer.draw(
     "sphere",
     [1.0, 0.98, 0.82],
-    [state.x - r * 0.28, r * 1.28, state.z - r * 0.5],
-    [r * 0.5, r * 0.37, r * 0.24],
-    [state.rollX, 0, state.rollZ],
-    0.88,
+    [
+      state.x + Math.cos(rollDotAngle) * r * 0.62,
+      r * (1 + rollDotLift * 0.46),
+      state.z + Math.sin(rollDotAngle) * r * 0.62,
+    ],
+    [r * 0.42, r * 0.3, r * 0.2],
+    [state.rollX * 0.72, rollDotAngle, state.rollZ * 0.72],
     1,
+    1,
+    { skinTile: 8, textureBlend: 0.28, textureScale: [1.3, 0.82] },
   );
   const visibleAttachments = state.attachments.slice(state.lowQuality ? -10 : -20);
   visibleAttachments.forEach((attachment, index) => {
@@ -4014,6 +4166,7 @@ function drawWorld(
       entry.drawShadow && shadowedItemIds.has(entry.item.id),
     );
   }
+  drawCollectionMarkers(renderer, state, markerTargets(state, visibleItems), visualTime);
   for (const particle of state.particles) {
     const life = clamp(particle.life, 0, 1);
     const size = base * (0.055 + life * 0.075);
@@ -4041,7 +4194,8 @@ function loadProgress() {
   try {
     return parseProgressJson(window.localStorage.getItem(SAVE_KEY), {
       maxEraIndex: ERAS.length - 1,
-      defaultSoundEnabled: true,
+      defaultBgmEnabled: true,
+      defaultSfxEnabled: true,
     });
   } catch {
     return defaultProgress({ maxEraIndex: ERAS.length - 1 });
@@ -4055,10 +4209,15 @@ export default function TimeRollGame() {
   const keysRef = useRef(new Set<string>());
   const joystickRef = useRef({ x: 0, y: 0, active: false, pointerId: -1 });
   const boostPressedRef = useRef(false);
-  const soundEnabledRef = useRef(true);
+  const audioElementRef = useRef<HTMLAudioElement>(null);
+  const bgmEnabledRef = useRef(true);
+  const sfxEnabledRef = useRef(true);
+  const bgmIntentRef = useRef(false);
+  const lastFxRef = useRef<{ name: AudioFxName | "none"; counter: number }>({ name: "none", counter: 0 });
   const audioContextRef = useRef<AudioContext | null>(null);
-  const [soundEnabled, setSoundEnabled] = useState(true);
-  const [progressSnapshot, setProgressSnapshot] = useState<TimeRollProgressV2>(
+  const [bgmEnabled, setBgmEnabled] = useState(true);
+  const [sfxEnabled, setSfxEnabled] = useState(true);
+  const [progressSnapshot, setProgressSnapshot] = useState<TimeRollProgress>(
     () => defaultProgress({ maxEraIndex: ERAS.length - 1 }),
   );
   const [fullscreen, setFullscreen] = useState(false);
@@ -4114,30 +4273,67 @@ export default function TimeRollGame() {
   const [hud, setHud] = useState(initialHud);
   const [fatalError, setFatalError] = useState("");
 
-  useEffect(() => {
-    soundEnabledRef.current = soundEnabled;
-  }, [soundEnabled]);
+  const syncBgm = useCallback(() => {
+    const audio = audioElementRef.current;
+    if (!audio) return;
+    audio.volume = BGM_VOLUME;
+    audio.loop = true;
+    if (bgmIntentRef.current && bgmEnabledRef.current) {
+      audio.play().catch(() => undefined);
+    } else {
+      audio.pause();
+    }
+  }, []);
 
-  const playTone = useCallback((frequency: number, duration = 0.09, rise = 0) => {
-    if (!soundEnabledRef.current) return;
+  useEffect(() => {
+    bgmEnabledRef.current = bgmEnabled;
+    syncBgm();
+  }, [bgmEnabled, syncBgm]);
+
+  useEffect(() => {
+    sfxEnabledRef.current = sfxEnabled;
+  }, [sfxEnabled]);
+
+  useEffect(() => () => {
+    const audio = audioElementRef.current;
+    if (audio) {
+      audio.pause();
+      audio.removeAttribute("src");
+      audio.load();
+    }
+    audioContextRef.current?.close().catch(() => undefined);
+    audioContextRef.current = null;
+  }, []);
+
+  const setBgmIntent = useCallback((intent: boolean) => {
+    bgmIntentRef.current = intent;
+    syncBgm();
+  }, [syncBgm]);
+
+  const playFx = useCallback((name: AudioFxName) => {
+    if (!sfxEnabledRef.current) return;
+    lastFxRef.current = { name, counter: lastFxRef.current.counter + 1 };
     try {
       let context = audioContextRef.current;
       if (!context) {
         context = new AudioContext();
         audioContextRef.current = context;
       }
-      const oscillator = context.createOscillator();
-      const gain = context.createGain();
-      oscillator.type = "triangle";
-      oscillator.frequency.setValueAtTime(frequency, context.currentTime);
-      oscillator.frequency.linearRampToValueAtTime(frequency + rise, context.currentTime + duration);
-      gain.gain.setValueAtTime(0.0001, context.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.08, context.currentTime + 0.012);
-      gain.gain.exponentialRampToValueAtTime(0.0001, context.currentTime + duration);
-      oscillator.connect(gain);
-      gain.connect(context.destination);
-      oscillator.start();
-      oscillator.stop(context.currentTime + duration + 0.02);
+      for (const [frequency, delay, duration] of AUDIO_FX_PATTERNS[name]) {
+        const oscillator = context.createOscillator();
+        const gain = context.createGain();
+        const startAt = context.currentTime + delay;
+        oscillator.type = name === "blocked" || name === "timeUp" ? "sine" : "triangle";
+        oscillator.frequency.setValueAtTime(frequency, startAt);
+        oscillator.frequency.linearRampToValueAtTime(frequency * 1.04, startAt + duration);
+        gain.gain.setValueAtTime(0.0001, startAt);
+        gain.gain.exponentialRampToValueAtTime(0.045, startAt + 0.018);
+        gain.gain.exponentialRampToValueAtTime(0.0001, startAt + duration);
+        oscillator.connect(gain);
+        gain.connect(context.destination);
+        oscillator.start(startAt);
+        oscillator.stop(startAt + duration + 0.03);
+      }
     } catch {
       // Sound is a bonus. Gameplay never depends on audio availability.
     }
@@ -4169,10 +4365,12 @@ export default function TimeRollGame() {
     const state = createState(0, reducedMotion, 20260730, lowQuality);
     const camera = createCameraState(state);
     gameRef.current = state;
-    soundEnabledRef.current = saved.soundEnabled;
+    bgmEnabledRef.current = saved.bgmEnabled;
+    sfxEnabledRef.current = saved.sfxEnabled;
     queueMicrotask(() => {
       if (!active) return;
-      setSoundEnabled(saved.soundEnabled);
+      setBgmEnabled(saved.bgmEnabled);
+      setSfxEnabled(saved.sfxEnabled);
       setProgressSnapshot(saved);
     });
     let bestEra = saved.bestEra;
@@ -4189,7 +4387,8 @@ export default function TimeRollGame() {
         ...savedProgress,
         bestEra,
         bestSize,
-        soundEnabled: soundEnabledRef.current,
+        bgmEnabled: bgmEnabledRef.current,
+        sfxEnabled: sfxEnabledRef.current,
       };
       try {
         window.localStorage.setItem(SAVE_KEY, serializeProgress(savedProgress));
@@ -4236,6 +4435,8 @@ export default function TimeRollGame() {
       state.radius = startingRadius(era.baseRadius);
       state.rollX = 0;
       state.rollZ = 0;
+      state.rollDeltaX = 0;
+      state.rollDeltaZ = 0;
       state.timer = era.seconds;
       state.boost = 1;
       state.items = generateItems(eraIndex, state.seed);
@@ -4319,8 +4520,9 @@ export default function TimeRollGame() {
           });
         }
       }
-      playTone(430 + state.era * 45, item.special ? 0.3 : 0.11, item.special ? 420 : 130);
-      playTone(690 + state.combo * 16, item.special ? 0.24 : 0.08, item.special ? 260 : 90);
+      if (!item.special) {
+        playFx(previousGrowthTier !== state.growthTier || state.combo % 5 === 0 ? "comboGrowth" : "pickup");
+      }
 
       const era = ERAS[state.era];
       if (state.eraCollected >= era.goal && !state.bossReady) {
@@ -4329,6 +4531,7 @@ export default function TimeRollGame() {
         state.finalReady = true;
         state.message = `${eraStory?.bossLabel ?? "거대 목표"} 해금! 충분히 커져서 코어를 모아요.`;
         state.messageTime = 5;
+        playFx("bossReady");
       }
       if (item.special) {
         const eraStory = getTimeRollEraStory(era.focus);
@@ -4338,13 +4541,13 @@ export default function TimeRollGame() {
           state.messageTime = 20;
           bestEra = ERAS.length - 1;
           saveEraResult();
-          playTone(660, 0.5, 520);
+          playFx("victory");
         } else {
           state.mode = "eraClear";
           state.message = eraStory?.clearTitle ?? `${era.name} 완성!`;
           state.messageTime = 10;
           saveEraResult();
-          playTone(620, 0.36, 380);
+          playFx("eraClear");
         }
       }
       syncHud(true);
@@ -4362,6 +4565,8 @@ export default function TimeRollGame() {
       if (state.comboTimer === 0) state.combo = 0;
       state.shake = Math.max(0, state.shake - safeDt * 2.5);
       state.cameraKick = Math.max(0, state.cameraKick - safeDt * 2.2);
+      state.rollDeltaX = 0;
+      state.rollDeltaZ = 0;
       for (const particle of state.particles) {
         particle.life -= safeDt;
         particle.vy -= state.radius * 4.5 * safeDt;
@@ -4433,8 +4638,10 @@ export default function TimeRollGame() {
       state.z = clamp(state.z, -half, half);
       if (state.x === -half || state.x === half) state.vx *= -0.22;
       if (state.z === -half || state.z === half) state.vz *= -0.22;
-      state.rollX += (state.z - previousZ) / Math.max(state.radius, 0.01);
-      state.rollZ -= (state.x - previousX) / Math.max(state.radius, 0.01);
+      state.rollDeltaX = (state.z - previousZ) / Math.max(state.radius, 0.01);
+      state.rollDeltaZ = -(state.x - previousX) / Math.max(state.radius, 0.01);
+      state.rollX += state.rollDeltaX;
+      state.rollZ += state.rollDeltaZ;
 
       for (const item of state.items) {
         if (item.collected) continue;
@@ -4474,7 +4681,7 @@ export default function TimeRollGame() {
             state.messageTime = 2.2;
             state.bumpCooldown = 0.75;
             state.shake = state.reducedMotion ? 0 : 0.25;
-            playTone(190, 0.08, -50);
+            playFx("blocked");
           }
         }
       }
@@ -4485,7 +4692,8 @@ export default function TimeRollGame() {
         state.message = "시간 종료 · 완료 조건을 달성하기 전에 시간이 끝났어요";
         state.messageTime = 20;
         persistProgress();
-        playTone(280, 0.22, -100);
+        setBgmIntent(false);
+        playFx("timeUp");
       }
       updateCamera(camera, state, safeDt);
       uiAccumulator += safeDt;
@@ -4493,6 +4701,9 @@ export default function TimeRollGame() {
     };
 
     const getTextState = () => {
+      const visibleCollectibleTelemetry = visibleCollectibles(state, camera, ERAS[state.era].baseRadius);
+      const markerTargetTelemetry = markerTargets(state, visibleCollectibleTelemetry);
+      const rollingCue = rollingCueSnapshot(state);
       const nearby = state.items
         .filter((item) => !item.collected)
         .map((item) => ({
@@ -4531,9 +4742,22 @@ export default function TimeRollGame() {
       } else if (state.blockedCollision) {
         feedbackKind = "blocked";
       }
+      const audio = audioElementRef.current;
       return JSON.stringify({
         coordinateSystem: "ground plane x/z; x increases right, z decreases forward; y is up",
         mode: state.mode,
+        audio: {
+          bgmEnabled: bgmEnabledRef.current,
+          sfxEnabled: sfxEnabledRef.current,
+          bgmIntent: bgmIntentRef.current ? "playing" : "paused",
+          bgmPaused: audio?.paused ?? true,
+          bgmPlayingIntent: bgmIntentRef.current && bgmEnabledRef.current,
+          trackSrc: audio?.getAttribute("src") ?? BGM_SRC,
+          volume: Number((audio?.volume ?? BGM_VOLUME).toFixed(2)),
+          loop: audio?.loop ?? true,
+          lastFx: lastFxRef.current.name,
+          lastFxCounter: lastFxRef.current.counter,
+        },
         era: {
           index: state.era + 1,
           total: ERAS.length,
@@ -4552,6 +4776,8 @@ export default function TimeRollGame() {
           roll: {
             x: Number(state.rollX.toFixed(3)),
             z: Number(state.rollZ.toFixed(3)),
+            deltaX: Number(state.rollDeltaX.toFixed(4)),
+            deltaZ: Number(state.rollDeltaZ.toFixed(4)),
           },
         },
         score: state.score,
@@ -4604,6 +4830,31 @@ export default function TimeRollGame() {
           renderedItems: renderStats.renderedItems,
           frameMsP95: Number(renderStats.frameMsP95.toFixed(2)),
         },
+        collectionMarkers: {
+          maxTargets: state.lowQuality ? 1 : 3,
+          count: markerTargetTelemetry.length,
+          targetIds: markerTargetTelemetry.map(({ item }) => item.id),
+          visibleCollectibleIds: visibleCollectibleTelemetry
+            .filter(({ item }) => !item.collected && canCollectByRule(state, item, state.bossReady))
+            .sort((a, b) => a.distance - b.distance)
+            .map(({ item }) => item.id),
+          targets: markerTargetTelemetry.map(({ item, distance }) => ({
+            id: item.id,
+            name: item.name,
+            distance: Number(distance.toFixed(2)),
+            requiredRadius: Number(requiredPlayerRadius(item).toFixed(2)),
+            collectible: canCollectByRule(state, item, state.bossReady),
+            special: !!item.special,
+          })),
+        },
+        rollingCue: {
+          active: rollingCue.active,
+          reason: rollingCue.reason,
+          speed: Number(rollingCue.speed.toFixed(4)),
+          rollDeltaX: Number(rollingCue.rollDeltaX.toFixed(4)),
+          rollDeltaZ: Number(rollingCue.rollDeltaZ.toFixed(4)),
+          rollMagnitude: Number(rollingCue.rollMagnitude.toFixed(4)),
+        },
         goal: {
           collected: state.eraCollected,
           required: ERAS[state.era].goal,
@@ -4649,17 +4900,20 @@ export default function TimeRollGame() {
       start: (eraIndex = 0) => {
         const safeEra = clamp(Math.floor(eraIndex), 0, bestEra);
         resetEra(safeEra, "playing");
-        playTone(420, 0.14, 180);
+        setBgmIntent(true);
+        playFx("start");
       },
       togglePause: () => {
         if (state.mode === "playing") {
           state.mode = "paused";
           state.message = "잠깐 쉬는 중";
           state.messageTime = 20;
+          setBgmIntent(false);
         } else if (state.mode === "paused") {
           state.mode = "playing";
           state.message = "다시 출발!";
           state.messageTime = 1.5;
+          setBgmIntent(true);
         }
         syncHud(true);
       },
@@ -4669,11 +4923,13 @@ export default function TimeRollGame() {
         bestEra = Math.max(bestEra, next);
         resetEra(next, "playing");
         persistProgress();
-        playTone(520, 0.22, 280);
+        setBgmIntent(true);
+        playFx("start");
       },
       retryEra: () => {
         resetEra(state.era, "playing");
-        playTone(380, 0.11, 100);
+        setBgmIntent(true);
+        playFx("start");
       },
       restart: () => {
         state.themeTotals = { ...EMPTY_TOTALS };
@@ -4683,7 +4939,8 @@ export default function TimeRollGame() {
         state.combo = 0;
         state.comboTimer = 0;
         resetEra(0, "playing");
-        playTone(420, 0.14, 180);
+        setBgmIntent(true);
+        playFx("start");
       },
       setBoost: (active: boolean) => {
         boostPressedRef.current = active;
@@ -4884,7 +5141,7 @@ export default function TimeRollGame() {
       gameRef.current = null;
       renderer.dispose();
     };
-  }, [playTone]);
+  }, [playFx, setBgmIntent]);
 
   const era = ERAS[hud.era];
   const eraStory = TIME_ROLL_ERA_STORIES[hud.era];
@@ -4906,21 +5163,35 @@ export default function TimeRollGame() {
     }
   }, []);
 
-  const toggleSound = useCallback(() => {
-    setSoundEnabled((enabled) => {
+  const persistAudioPreferences = useCallback((nextBgmEnabled: boolean, nextSfxEnabled: boolean) => {
+    try {
+      const current = loadProgress();
+      const updated = { ...current, bgmEnabled: nextBgmEnabled, sfxEnabled: nextSfxEnabled };
+      window.localStorage.setItem(SAVE_KEY, serializeProgress(updated));
+      setProgressSnapshot(updated);
+    } catch {
+      // Audio remains usable even when local storage is unavailable.
+    }
+  }, []);
+
+  const toggleBgm = useCallback(() => {
+    setBgmEnabled((enabled) => {
       const next = !enabled;
-      soundEnabledRef.current = next;
-      try {
-        const current = loadProgress();
-        const updated = { ...current, soundEnabled: next };
-        window.localStorage.setItem(SAVE_KEY, serializeProgress(updated));
-        setProgressSnapshot(updated);
-      } catch {
-        // Sound remains usable even when local storage is unavailable.
-      }
+      bgmEnabledRef.current = next;
+      persistAudioPreferences(next, sfxEnabledRef.current);
+      queueMicrotask(syncBgm);
       return next;
     });
-  }, []);
+  }, [persistAudioPreferences, syncBgm]);
+
+  const toggleSfx = useCallback(() => {
+    setSfxEnabled((enabled) => {
+      const next = !enabled;
+      sfxEnabledRef.current = next;
+      persistAudioPreferences(bgmEnabledRef.current, next);
+      return next;
+    });
+  }, [persistAudioPreferences]);
 
   const updateJoystickFromPointer = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
     const box = event.currentTarget.getBoundingClientRect();
@@ -4958,12 +5229,22 @@ export default function TimeRollGame() {
     setJoystickKnob({ x: 0, y: 0 });
   }, []);
 
+  const pickupFeedbackActive = hud.mode === "playing" && !!hud.pickupFeedback && hud.pickupFeedback.life > 0;
+  const activePickupFeedback = pickupFeedbackActive ? hud.pickupFeedback : null;
+
   return (
-    <main className="game-shell" data-era={hud.era}>
+    <main className="game-shell" data-era={hud.era} data-pickup-feedback-active={pickupFeedbackActive ? "true" : "false"}>
       <canvas
         ref={canvasRef}
         className="game-canvas"
         aria-label="시간 구슬을 굴려 시대별 물건을 모으는 3D 게임 화면"
+      />
+      <audio
+        ref={audioElementRef}
+        src={BGM_SRC}
+        loop
+        preload="auto"
+        aria-hidden="true"
       />
 
       {fatalError ? (
@@ -5065,14 +5346,6 @@ export default function TimeRollGame() {
           <button
             type="button"
             className="icon-button"
-            aria-label={soundEnabled ? "소리 끄기" : "소리 켜기"}
-            onClick={toggleSound}
-          >
-            {soundEnabled ? "♪" : "×♪"}
-          </button>
-          <button
-            type="button"
-            className="icon-button"
             aria-label={fullscreen ? "전체화면 닫기" : "전체화면 열기"}
             onClick={toggleFullscreen}
           >
@@ -5087,6 +5360,26 @@ export default function TimeRollGame() {
           >
             {hud.mode === "paused" ? "▶" : "Ⅱ"}
           </button>
+          <button
+            type="button"
+            className="icon-button audio-toggle"
+            aria-label={bgmEnabled ? "배경음악 끄기" : "배경음악 켜기"}
+            aria-pressed={bgmEnabled}
+            onClick={toggleBgm}
+          >
+            <span aria-hidden="true">음악</span>
+            <strong aria-hidden="true">{bgmEnabled ? "켬" : "끔"}</strong>
+          </button>
+          <button
+            type="button"
+            className="icon-button audio-toggle"
+            aria-label={sfxEnabled ? "효과음 끄기" : "효과음 켜기"}
+            aria-pressed={sfxEnabled}
+            onClick={toggleSfx}
+          >
+            <span aria-hidden="true">효과</span>
+            <strong aria-hidden="true">{sfxEnabled ? "켬" : "끔"}</strong>
+          </button>
         </div>
 
         {hud.message ? (
@@ -5095,23 +5388,23 @@ export default function TimeRollGame() {
           </div>
         ) : null}
 
-        {hud.pickupFeedback && hud.pickupFeedback.life > 0 && hud.mode === "playing" ? (
+        {activePickupFeedback ? (
           <div
-            className={`pickup-callout ${hud.pickupFeedback.sizeUp ? "is-size-up" : ""}`}
-            key={hud.pickupFeedback.sequence}
+            className={`pickup-callout ${activePickupFeedback.sizeUp ? "is-size-up" : ""}`}
+            key={activePickupFeedback.sequence}
             aria-hidden="true"
           >
             <span
               className="pickup-category"
-              style={{ backgroundColor: `rgb(${THEME_BY_ID[hud.pickupFeedback.theme].color.map((value) => Math.round(value * 255)).join(",")})` }}
+              style={{ backgroundColor: `rgb(${THEME_BY_ID[activePickupFeedback.theme].color.map((value) => Math.round(value * 255)).join(",")})` }}
             >
-              {THEME_BY_ID[hud.pickupFeedback.theme].icon} {THEME_BY_ID[hud.pickupFeedback.theme].label}
+              {THEME_BY_ID[activePickupFeedback.theme].icon} {THEME_BY_ID[activePickupFeedback.theme].label}
             </span>
             <strong>수집 성공!</strong>
-            <b>{hud.pickupFeedback.itemName}</b>
+            <b>{activePickupFeedback.itemName}</b>
             <em>
-              +{hud.pickupFeedback.gainedScore.toLocaleString("ko-KR")}점 · {hud.pickupFeedback.combo} 콤보
-              {hud.pickupFeedback.sizeUp ? " · 크기 UP!" : ""}
+              +{activePickupFeedback.gainedScore.toLocaleString("ko-KR")}점 · {activePickupFeedback.combo} 콤보
+              {activePickupFeedback.sizeUp ? " · 크기 UP!" : ""}
             </em>
           </div>
         ) : null}

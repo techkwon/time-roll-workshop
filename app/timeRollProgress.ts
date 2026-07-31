@@ -1,4 +1,4 @@
-export const TIME_ROLL_PROGRESS_VERSION = 2;
+export const TIME_ROLL_PROGRESS_VERSION = 3;
 
 export type TimeRollRank = "S" | "A" | "B";
 
@@ -9,14 +9,15 @@ export type TimeRollEraProgress = {
   completed: boolean;
 };
 
-export type TimeRollProgressV2 = {
+export type TimeRollProgress = {
   version: typeof TIME_ROLL_PROGRESS_VERSION;
   bestEra: number;
   bestSize: number;
   totalScore: number;
   eras: Record<string, TimeRollEraProgress>;
   storyEndingSeen: boolean;
-  soundEnabled: boolean;
+  bgmEnabled: boolean;
+  sfxEnabled: boolean;
 };
 
 export type TimeRollProgressInput = {
@@ -26,11 +27,15 @@ export type TimeRollProgressInput = {
   eras?: unknown;
   storyEndingSeen?: unknown;
   soundEnabled?: unknown;
+  bgmEnabled?: unknown;
+  sfxEnabled?: unknown;
 };
 
 export type TimeRollProgressOptions = {
   maxEraIndex?: number;
   defaultSoundEnabled?: boolean;
+  defaultBgmEnabled?: boolean;
+  defaultSfxEnabled?: boolean;
 };
 
 export type TimeRollEraResult = {
@@ -113,10 +118,19 @@ function totalScoreFromEras(eras: Record<string, TimeRollEraProgress>) {
   return Object.values(eras).reduce((total, era) => total + era.bestScore, 0);
 }
 
-function normalizeProgress(input: TimeRollProgressInput, options: TimeRollProgressOptions = {}): TimeRollProgressV2 {
+function defaultBgmEnabled(options: TimeRollProgressOptions) {
+  return options.defaultBgmEnabled ?? options.defaultSoundEnabled ?? true;
+}
+
+function defaultSfxEnabled(options: TimeRollProgressOptions) {
+  return options.defaultSfxEnabled ?? options.defaultSoundEnabled ?? true;
+}
+
+function normalizeProgress(input: TimeRollProgressInput, options: TimeRollProgressOptions = {}): TimeRollProgress {
   const maxEra = safeMaxEraIndex(options);
   const eras = normalizeEras(input.eras);
   const totalScore = totalScoreFromEras(eras);
+  const migratedSound = typeof input.soundEnabled === "boolean" ? input.soundEnabled : undefined;
 
   return {
     version: TIME_ROLL_PROGRESS_VERSION,
@@ -125,17 +139,20 @@ function normalizeProgress(input: TimeRollProgressInput, options: TimeRollProgre
     totalScore: totalScore > 0 ? totalScore : nonNegativeNumber(input.totalScore),
     eras,
     storyEndingSeen: input.storyEndingSeen === true,
-    soundEnabled: typeof input.soundEnabled === "boolean"
-      ? input.soundEnabled
-      : options.defaultSoundEnabled ?? true,
+    bgmEnabled: typeof input.bgmEnabled === "boolean"
+      ? input.bgmEnabled
+      : migratedSound ?? defaultBgmEnabled(options),
+    sfxEnabled: typeof input.sfxEnabled === "boolean"
+      ? input.sfxEnabled
+      : migratedSound ?? defaultSfxEnabled(options),
   };
 }
 
-export function defaultProgress(options: TimeRollProgressOptions = {}): TimeRollProgressV2 {
+export function defaultProgress(options: TimeRollProgressOptions = {}): TimeRollProgress {
   return normalizeProgress({}, options);
 }
 
-export function parseProgressJson(raw: string | null | undefined, options: TimeRollProgressOptions = {}): TimeRollProgressV2 {
+export function parseProgressJson(raw: string | null | undefined, options: TimeRollProgressOptions = {}): TimeRollProgress {
   if (!raw) return defaultProgress(options);
 
   try {
@@ -149,6 +166,10 @@ export function parseProgressJson(raw: string | null | undefined, options: TimeR
       return normalizeProgress(candidate, options);
     }
 
+    if (candidate.version === 2) {
+      return normalizeProgress(candidate, options);
+    }
+
     if (candidate.version === undefined && ("bestEra" in candidate || "bestSize" in candidate)) {
       return normalizeProgress({ bestEra: candidate.bestEra, bestSize: candidate.bestSize }, options);
     }
@@ -159,11 +180,11 @@ export function parseProgressJson(raw: string | null | undefined, options: TimeR
   }
 }
 
-export function serializeProgress(progress: TimeRollProgressV2) {
+export function serializeProgress(progress: TimeRollProgress) {
   return JSON.stringify(normalizeProgress(progress));
 }
 
-export function recordEraResult(progress: TimeRollProgressV2, result: TimeRollEraResult, options: TimeRollProgressOptions = {}) {
+export function recordEraResult(progress: TimeRollProgress, result: TimeRollEraResult, options: TimeRollProgressOptions = {}) {
   const normalized = normalizeProgress(progress, options);
   const maxEra = safeMaxEraIndex(options);
   const era = clampInteger(result.era, 0, maxEra);
@@ -191,6 +212,6 @@ export function recordEraResult(progress: TimeRollProgressV2, result: TimeRollEr
   };
 }
 
-export function resetProgress(options: TimeRollProgressOptions = {}): TimeRollProgressV2 {
+export function resetProgress(options: TimeRollProgressOptions = {}): TimeRollProgress {
   return defaultProgress(options);
 }

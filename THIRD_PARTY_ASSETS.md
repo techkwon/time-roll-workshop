@@ -54,3 +54,11 @@ The selected Nature Kit OBJ files do not depend on a bundled texture atlas at ru
 - Runtime file: `public/textures/time-roll-material-atlas-5x5.png`
 - Dimensions: 1250 x 1250 PNG, 5 x 5 grid, no alpha channel
 - Intended use: local material/skin tiles for manufacturing, construction, transport, communication, and life-themed objects.
+
+## User-Supplied BGM
+
+- Source: user-supplied audio authorized by the project owner for this game
+- Runtime file: `public/audio/playful-chaos-hook.m4a`
+- SHA-256: `e78b736c1b74505f77f9637bfff76fb6e8b1b78a974ae1113faa6645b31fcd2c`
+- Intended use: locally bundled looping BGM with no runtime hotlink.
+- License note: not claimed as CC0 and not distributed separately from the game package.

@@ -545,7 +545,8 @@ button {
   position: absolute;
   top: 14px;
   right: 14px;
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(4, 44px);
   gap: 6px;
   pointer-events: auto;
 }
@@ -563,8 +564,19 @@ button {
     rgb(255 253 244 / 82%);
   box-shadow: var(--soft-depth);
   backdrop-filter: blur(12px);
+  font-size: 11px;
   font-weight: 950;
   cursor: pointer;
+}
+
+.audio-toggle {
+  align-content: center;
+  gap: 1px;
+  line-height: 1;
+}
+
+.audio-toggle strong {
+  font-size: 10px;
 }
 
 .icon-button:disabled {
@@ -1453,7 +1465,7 @@ kbd {
     left: 6px;
     grid-template-columns: minmax(0, 1fr) 78px;
     gap: 4px;
-    width: calc(100% - 144px);
+    width: calc(100% - 12px);
     transform: none;
   }
 
@@ -1529,24 +1541,32 @@ kbd {
   }
 
   .hud-actions {
-    top: 6px;
+    top: 202px;
     right: 6px;
-    flex-direction: row;
+    grid-template-columns: repeat(2, 44px);
     gap: 4px;
   }
 
+  .game-shell[data-pickup-feedback-active="true"] .hud-actions {
+    visibility: hidden;
+    opacity: 0;
+    pointer-events: none;
+  }
+
   .icon-button {
-    width: 40px;
-    height: 40px;
+    width: 44px;
+    height: 44px;
     border-radius: 10px 4px 10px 4px;
     font-size: 11px;
   }
 
   .game-message {
     top: 190px;
-    max-width: min(360px, calc(100% - 84px));
+    left: 6px;
+    max-width: calc(100% - 112px);
     padding: 6px 10px;
     font-size: 10px;
+    transform: none;
   }
 
   .growth-panel {
