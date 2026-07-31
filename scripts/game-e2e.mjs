@@ -6,6 +6,8 @@ import sharp from "sharp";
 const url = process.env.GAME_URL || "http://localhost:3000";
 const saveKey = "time-roll-workshop-v1";
 const outputDir = new URL("../output/e2e/", import.meta.url);
+const MOBILE_DRAW_CALL_CAP = 180;
+const MOBILE_TRANSPARENT_CALL_CAP = 35;
 const expectedVisualAssetPaths = [
   "/textures/time-roll-material-atlas-5x5.png",
   "/textures/time-roll-object-atlas-10x5.png",
@@ -124,6 +126,113 @@ function outputPath(filename) {
 
 function angleDistance(a, b) {
   return Math.abs(Math.atan2(Math.sin(a - b), Math.cos(a - b)));
+}
+
+function requireTelemetryObject(state, fieldName) {
+  const value = state[fieldName];
+  assert.ok(
+    value && typeof value === "object",
+    `render_game_to_text should expose ${fieldName} telemetry`,
+  );
+  return value;
+}
+
+function requireTelemetryBoolean(source, fieldName, ownerName) {
+  assert.equal(
+    typeof source[fieldName],
+    "boolean",
+    `${ownerName}.${fieldName} should be a boolean telemetry field`,
+  );
+  return source[fieldName];
+}
+
+function requirePlayerRoll(state) {
+  const roll = state.player?.roll;
+  assert.ok(
+    roll && typeof roll === "object",
+    "render_game_to_text should expose player.roll telemetry",
+  );
+  const x = Number(roll.x);
+  const z = Number(roll.z);
+  assert.ok(Number.isFinite(x) && Number.isFinite(z), `player.roll should expose numeric x/z values; roll=${JSON.stringify(roll)}`);
+  return { x, z };
+}
+
+function feedbackIndicatesSuccess(feedback) {
+  return feedback.success === true;
+}
+
+function feedbackHasParticles(feedback) {
+  return Number(feedback.particleCount) > 0;
+}
+
+function feedbackHasCallout(feedback) {
+  const callout = feedback.callout;
+  return typeof callout === "string" && callout.trim().length > 0;
+}
+
+function assertMobileRenderBudget(renderStats, label) {
+  assert.ok(renderStats, `${label} should expose renderStats`);
+  assert.ok(
+    renderStats.drawCalls <= MOBILE_DRAW_CALL_CAP,
+    `${label} mobile drawCalls=${renderStats.drawCalls}`,
+  );
+  assert.ok(
+    renderStats.transparentCalls <= MOBILE_TRANSPARENT_CALL_CAP,
+    `${label} mobile transparentCalls=${renderStats.transparentCalls}`,
+  );
+}
+
+function assertEndCondition(state, expectedPhases, label) {
+  const endCondition = requireTelemetryObject(state, "endCondition");
+  assert.equal(
+    typeof endCondition.phase,
+    "string",
+    `${label} endCondition should expose a string phase; actual=${JSON.stringify(endCondition)}`,
+  );
+  assert.ok(
+    expectedPhases.includes(endCondition.phase),
+    `${label} should expose endCondition phase ${expectedPhases.join(" or ")}; actual=${JSON.stringify(endCondition)}`,
+  );
+  assert.ok(
+    typeof endCondition.label === "string",
+    `${label} endCondition should expose stable HUD copy; actual=${JSON.stringify(endCondition)}`,
+  );
+  return endCondition;
+}
+
+async function assertOverlayMessaging(page, mode, expectedPatterns, label) {
+  const state = await readState(page);
+  assert.equal(state.mode, mode, `${label} should reach ${mode}`);
+  const text = await page.locator("body").innerText();
+  for (const pattern of expectedPatterns) {
+    assert.match(text, pattern, `${label} ${mode} overlay should include ${pattern}`);
+  }
+}
+
+async function assertPickupHasSingleLiveAnnouncement(page) {
+  await page.locator(".pickup-callout[aria-hidden='true']").waitFor({ state: "visible" });
+  await page.locator(".pickup-callout-copy.sr-only").waitFor({ state: "attached" });
+  assert.equal(
+    await page.locator("[aria-live='polite']").count(),
+    1,
+    "pickup should have exactly one polite live region",
+  );
+  assert.equal(
+    await page.locator(".game-message[role='status'][aria-live='polite']").count(),
+    1,
+    "visible pickup status should be the polite live announcement",
+  );
+  assert.equal(
+    await page.locator(".pickup-callout[aria-live], .pickup-callout-copy[aria-live]").count(),
+    0,
+    "visual pickup callout and sr-only pickup copy should not create extra live regions",
+  );
+  assert.match(
+    await page.locator(".pickup-callout-copy.sr-only").textContent(),
+    /수집 성공!/,
+    "sr-only pickup copy should duplicate the pickup success text without being live",
+  );
 }
 
 async function captureCanvas(page, filename) {
@@ -298,6 +407,30 @@ try {
   checks.push("v1 progress migrates to v2 and sound toggle survives reload");
   await migration.close();
 
+  const reducedMotion = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+  await reducedMotion.emulateMedia({ reducedMotion: "reduce" });
+  trackErrors(reducedMotion, "reduced-motion");
+  await prepareStorage(reducedMotion, null);
+  await reducedMotion.goto(url, { waitUntil: "domcontentloaded" });
+  await reducedMotion.waitForSelector("#start-btn");
+  await reducedMotion.click("#start-btn");
+  await waitForVisualAssets(reducedMotion);
+  let reducedState = await readState(reducedMotion);
+  assert.equal(reducedState.reducedMotion, true);
+  const reducedPickup = reducedState.nearby.find((entry) => entry.collectible && !entry.special);
+  assert.ok(reducedPickup, "reduced-motion pickup FX check needs a deterministic collectible");
+  await callTestHook(reducedMotion, "setRadiusRatio", (reducedPickup.requiredRadius * 1.02) / (reducedState.player.radius / reducedState.player.growthRatio));
+  await callTestHook(reducedMotion, "warpToItem", reducedPickup.id);
+  assert.equal(await callTestHook(reducedMotion, "collectItem", reducedPickup.id), true);
+  reducedState = await readState(reducedMotion);
+  const reducedFeedback = requireTelemetryObject(reducedState, "feedback");
+  assert.equal(reducedFeedback.success, true, `reduced-motion pickup should still announce success; feedback=${JSON.stringify(reducedFeedback)}`);
+  assert.equal(reducedFeedback.successFxActive, false, `reduced-motion pickup should suppress world FX telemetry; feedback=${JSON.stringify(reducedFeedback)}`);
+  assert.equal(feedbackHasParticles(reducedFeedback), false, `reduced-motion pickup should suppress particles; feedback=${JSON.stringify(reducedFeedback)}`);
+  assert.match(await reducedMotion.locator("body").innerText(), /수집 성공!/, "reduced-motion pickup should keep visible success UI");
+  checks.push("reduced-motion pickup keeps success UI but suppresses world FX telemetry");
+  await reducedMotion.close();
+
   const desktop = await browser.newPage({ viewport: { width: 1280, height: 720 } });
   trackErrors(desktop, "desktop");
   await prepareStorage(desktop, null);
@@ -319,6 +452,22 @@ try {
   assert.equal(state.player.growthTier, "tiny");
   assert.ok(state.player.growthRatio < 0.2);
   await desktop.screenshot({ path: new URL("desktop-playing-start.png", outputDir).pathname, fullPage: true });
+  let endCondition = assertEndCondition(state, ["collect"], "desktop opening HUD");
+  assert.match(await desktop.locator("body").innerText(), /게임 종료 조건/, "desktop HUD should show the explicit end condition");
+  assert.ok(
+    JSON.stringify(endCondition).includes(String(state.goal.required - state.goal.collected)) ||
+      JSON.stringify(endCondition).includes(state.goal.bossTarget?.name ?? ""),
+    `desktop opening endCondition should describe collect progress or boss target; actual=${JSON.stringify(endCondition)}`,
+  );
+  const debugRobot = requireTelemetryObject(state, "debugRobot");
+  assert.equal(requireTelemetryBoolean(debugRobot, "behindBall", "debugRobot"), true);
+  assert.equal(requireTelemetryBoolean(debugRobot, "handsAtContact", "debugRobot"), true);
+  await captureCanvas(desktop, "robot-ball-contact-start.png");
+  observations.robotBallContact = {
+    debugRobot,
+    screenshot: "robot-ball-contact-start.png",
+  };
+  checks.push("robot telemetry keeps Tori behind the time ball with hands at contact");
 
   const robotHeadingCases = [
     { label: "Front 0 deg", slug: "front-0deg", heading: 0 },
@@ -366,14 +515,20 @@ try {
   await callTestHook(desktop, "startEra", 0);
   await callTestHook(desktop, "setCameraHeading", 0);
   state = await readState(desktop);
+  const blockedScoreBefore = state.score;
   const oversized = findOversizedItem(state);
   assert.equal(await callTestHook(desktop, "warpToItem", oversized.id), true);
   assert.equal(await callTestHook(desktop, "collectItem", oversized.id), false);
   state = await readState(desktop);
   assert.equal(state.mode, "playing");
   assert.equal(state.lastCollection, "");
+  assert.equal(state.score, blockedScoreBefore);
   await desktop.evaluate(() => window.advanceTime?.(100));
   state = await readState(desktop);
+  const blockedFeedback = requireTelemetryObject(state, "feedback");
+  assert.equal(feedbackIndicatesSuccess(blockedFeedback), false, `blocked collision should not expose success feedback; feedback=${JSON.stringify(blockedFeedback)}`);
+  assert.equal(feedbackHasParticles(blockedFeedback), false, `blocked collision should not expose success particles; feedback=${JSON.stringify(blockedFeedback)}`);
+  assert.equal(state.score, blockedScoreBefore);
   const pushedOversized = state.nearby.find((entry) => entry.id === oversized.id);
   assert.ok(pushedOversized, "oversized collision target should remain in the world");
   const oversizedCollisionDistance = state.player.radius + pushedOversized.size * 0.58;
@@ -386,16 +541,29 @@ try {
     distance: pushedOversized.distance,
     collisionDistance: Number(oversizedCollisionDistance.toFixed(3)),
     blockedCollision: state.blockedCollision,
+    feedback: blockedFeedback,
   };
-  checks.push("oversized collision pushes clear even while bump feedback is cooling down");
+  checks.push("oversized collision pushes clear without success FX, particles, or score");
   checks.push("starts tiny and blocks an oversized item");
 
   await callTestHook(desktop, "setRadiusRatio", (oversized.requiredRadius * 1.02) / (state.player.radius / state.player.growthRatio));
   assert.equal(await callTestHook(desktop, "collectItem", oversized.id), true);
   state = await readState(desktop);
+  const successFeedback = requireTelemetryObject(state, "feedback");
   assert.equal(state.lastCollection.startsWith(oversized.name), true);
+  assert.equal(feedbackIndicatesSuccess(successFeedback), true, `successful pickup should expose success feedback; feedback=${JSON.stringify(successFeedback)}`);
+  assert.equal(feedbackHasParticles(successFeedback), true, `successful pickup should expose pickup particles; feedback=${JSON.stringify(successFeedback)}`);
+  assert.equal(feedbackHasCallout(successFeedback), true, `successful pickup should expose a callout; feedback=${JSON.stringify(successFeedback)}`);
+  assert.match(await desktop.locator("body").innerText(), /수집 성공!/, "successful pickup should show a visible success callout");
+  await assertPickupHasSingleLiveAnnouncement(desktop);
   assert.ok(["small", "medium", "large", "monument"].includes(state.player.growthTier));
-  checks.push("same oversized item collects after deterministic size setup");
+  await desktop.screenshot({ path: new URL("desktop-pickup-success.png", outputDir).pathname, fullPage: true });
+  await desktop.evaluate(() => window.advanceTime?.(2600));
+  state = await readState(desktop);
+  const clearedFeedback = requireTelemetryObject(state, "feedback");
+  assert.equal(feedbackIndicatesSuccess(clearedFeedback), false, `pickup success feedback should clear after its lifetime; feedback=${JSON.stringify(clearedFeedback)}`);
+  assert.equal(feedbackHasParticles(clearedFeedback), false, `pickup particles should clear after their lifetime; feedback=${JSON.stringify(clearedFeedback)}`);
+  checks.push("same oversized item collects after deterministic size setup and success FX clears");
 
   await callTestHook(desktop, "startEra", 0);
   state = await readState(desktop);
@@ -410,6 +578,7 @@ try {
   await callTestHook(desktop, "setRadiusRatio", 0.2);
   state = await readState(desktop);
   assert.equal(state.goal.bossReady, true);
+  assertEndCondition(state, ["boss"], "desktop boss HUD");
   assert.equal(state.goal.bossTarget.collectible, false);
   assert.equal(await callTestHook(desktop, "collectItem", boss.id), false);
   assert.equal((await readState(desktop)).mode, "playing");
@@ -419,6 +588,7 @@ try {
   assert.equal(await callTestHook(desktop, "collectItem", boss.id), true);
   state = await readState(desktop);
   assert.equal(state.mode, "eraClear");
+  await assertOverlayMessaging(desktop, "eraClear", [/거대 코어/, /시대 점수/, /다음 시대로/], "desktop");
   assert.equal(state.goal.bossTarget.collected, true);
   assert.ok(state.goal.collected >= state.goal.required);
   await desktop.screenshot({ path: new URL("desktop-era-clear.png", outputDir).pathname, fullPage: true });
@@ -477,15 +647,26 @@ try {
   assert.equal(state.mode, "playing");
   checks.push("pause and resume");
 
+  await callTestHook(desktop, "startEra", 0);
+  await desktop.evaluate(() => window.advanceTime?.(200000));
+  await assertOverlayMessaging(desktop, "timeUp", [/시간 종료/, /조금만 더 굴려볼까요/, /이 시대 다시 도전/], "desktop");
+  await desktop.screenshot({ path: new URL("desktop-time-up.png", outputDir).pathname, fullPage: true });
+  checks.push("desktop time-up overlay explains current record and retry action");
+
+  await callTestHook(desktop, "startEra", 1);
   await callTestHook(desktop, "setCameraHeading", 0);
   state = await readState(desktop);
   const idleCamera = state.camera;
+  const rollBeforeMove = requirePlayerRoll(state);
   await desktop.keyboard.down("ArrowRight");
   await desktop.keyboard.down("Shift");
   await desktop.evaluate(() => window.advanceTime?.(900));
   await desktop.keyboard.up("Shift");
   await desktop.keyboard.up("ArrowRight");
   state = await readState(desktop);
+  const rollAfterMove = requirePlayerRoll(state);
+  const rollDelta = Math.hypot(rollAfterMove.x - rollBeforeMove.x, rollAfterMove.z - rollBeforeMove.z);
+  assert.ok(rollDelta > 0.05, `player.roll should change after movement; before=${JSON.stringify(rollBeforeMove)} after=${JSON.stringify(rollAfterMove)}`);
   assert.ok(state.player.x > 0.1);
   assert.ok(state.camera.speed01 > 0.08, `dynamic camera should register movement speed; speed01=${state.camera.speed01}`);
   const dynamicCameraDelta = {
@@ -523,6 +704,9 @@ try {
     idleCamera,
     movingCamera: state.camera,
     delta: dynamicCameraDelta,
+    rollBeforeMove,
+    rollAfterMove,
+    rollDelta: Number(rollDelta.toFixed(3)),
     boostAfterMove: state.boost,
     playerFraming,
     screenshot: "desktop-playing-dynamic.png",
@@ -676,8 +860,39 @@ try {
   state = await readState(desktop);
   assert.equal(state.era.index, 5);
   assert.equal(state.mode, "victory");
+  assertEndCondition(state, ["finalVictory"], "desktop final victory HUD");
+  await assertOverlayMessaging(desktop, "victory", [/시간 구슬/, /거대 목표/, /다시 시간여행/], "desktop");
   await desktop.screenshot({ path: new URL("desktop-victory.png", outputDir).pathname, fullPage: true });
   checks.push("all five eras and final future biodome victory");
+
+  const terminalTimeoutRegression = [];
+  for (const terminalCase of [
+    { eraIndex: 0, expectedMode: "eraClear" },
+    { eraIndex: 4, expectedMode: "victory" },
+  ]) {
+    await callTestHook(desktop, "startEra", terminalCase.eraIndex);
+    await callTestHook(desktop, "unlockBoss");
+    state = await readState(desktop);
+    const target = state.goal.bossTarget;
+    await callTestHook(desktop, "setRadiusRatio", (target.requiredRadius * 1.04) / (state.player.radius / state.player.growthRatio));
+    await callTestHook(desktop, "warpToItem", target.id);
+    await callTestHook(desktop, "setTimer", 0.001);
+    await desktop.evaluate(() => window.advanceTime?.(1000 / 60));
+    state = await readState(desktop);
+    assert.equal(
+      state.mode,
+      terminalCase.expectedMode,
+      `near-zero timer boss pickup should preserve ${terminalCase.expectedMode}`,
+    );
+    assert.equal(state.goal.bossTarget.collected, true);
+    terminalTimeoutRegression.push({
+      era: terminalCase.eraIndex + 1,
+      mode: state.mode,
+      timerSeconds: state.timer,
+      bossCollected: state.goal.bossTarget.collected,
+    });
+  }
+  observations.terminalTimeoutRegression = terminalTimeoutRegression;
   await desktop.close();
 
   const mobile = await browser.newPage({
@@ -703,17 +918,12 @@ try {
   await mobile.click("#start-btn");
   await waitForVisualAssets(mobile);
   const beforeJoystick = await readState(mobile);
-  observations.mobileRenderStats = beforeJoystick.renderStats;
-  assert.ok(beforeJoystick.renderStats.drawCalls <= 180, `mobile drawCalls=${beforeJoystick.renderStats.drawCalls}`);
-  assert.ok(
-    beforeJoystick.renderStats.transparentCalls <= 35,
-    `mobile transparentCalls=${beforeJoystick.renderStats.transparentCalls}`,
-  );
-  if (beforeJoystick.renderStats.frameMsP95 > 60) {
-    checks.push(`mobile p95 recorded without hard cap: ${beforeJoystick.renderStats.frameMsP95}ms`);
-  } else {
-    checks.push(`mobile p95 within 60ms: ${beforeJoystick.renderStats.frameMsP95}ms`);
-  }
+  await mobile.screenshot({ path: new URL("mobile-playing.png", outputDir).pathname, fullPage: true });
+  observations.mobileRenderStats = {
+    initial: beforeJoystick.renderStats,
+  };
+  assertMobileRenderBudget(beforeJoystick.renderStats, "initial mobile play");
+  checks.push(`mobile p95 telemetry captured under noisy SwiftShader only: ${beforeJoystick.renderStats.frameMsP95}ms`);
   const joystick = mobile.locator(".joystick");
   const box = await joystick.boundingBox();
   assert.ok(box, "mobile joystick should have a bounding box");
@@ -724,8 +934,51 @@ try {
   state = await readState(mobile);
   const moved = Math.hypot(state.player.x - beforeJoystick.player.x, state.player.z - beforeJoystick.player.z);
   assert.ok(moved > 0.1, `joystick should move player; moved=${moved}`);
-  await mobile.screenshot({ path: new URL("mobile-playing.png", outputDir).pathname, fullPage: true });
+  observations.mobileRenderStats.moving = state.renderStats;
+  assertMobileRenderBudget(state.renderStats, "mobile joystick movement");
+  await mobile.screenshot({ path: new URL("mobile-moving.png", outputDir).pathname, fullPage: true });
   checks.push("mobile fit and pointer joystick movement");
+
+  await callTestHook(mobile, "startEra", 0);
+  await callTestHook(mobile, "setRadiusRatio", 0.35);
+  state = await readState(mobile);
+  const mobilePickup = state.nearby.find((entry) => entry.collectible && !entry.special);
+  assert.ok(mobilePickup, "mobile pickup FX needs a deterministic collectible");
+  await callTestHook(mobile, "warpToItem", mobilePickup.id);
+  assert.equal(await callTestHook(mobile, "collectItem", mobilePickup.id), true);
+  await mobile.evaluate(() => window.advanceTime?.(1000 / 60));
+  state = await readState(mobile);
+  const mobileSuccessFeedback = requireTelemetryObject(state, "feedback");
+  assert.equal(feedbackIndicatesSuccess(mobileSuccessFeedback), true, `mobile pickup should expose success feedback; feedback=${JSON.stringify(mobileSuccessFeedback)}`);
+  assert.equal(feedbackHasParticles(mobileSuccessFeedback), true, `mobile pickup should expose pickup particles; feedback=${JSON.stringify(mobileSuccessFeedback)}`);
+  observations.mobileRenderStats.pickupSuccess = state.renderStats;
+  assertMobileRenderBudget(state.renderStats, "mobile pickup success FX");
+  assert.match(await mobile.locator("body").innerText(), /수집 성공!/, "mobile should show a visible pickup success callout");
+  await mobile.screenshot({ path: new URL("mobile-pickup-success.png", outputDir).pathname, fullPage: true });
+  await mobile.evaluate(() => window.advanceTime?.(1000));
+  checks.push("mobile pickup success callout and FX are visible");
+
+  await callTestHook(mobile, "startEra", 0);
+  await mobile.evaluate(() => window.advanceTime?.(200000));
+  await assertOverlayMessaging(mobile, "timeUp", [/시간 종료/, /조금만 더 굴려볼까요/, /이 시대 다시 도전/], "mobile");
+  await mobile.screenshot({ path: new URL("mobile-time-up.png", outputDir).pathname, fullPage: true });
+  checks.push("mobile time-up overlay preserves record and retry messaging");
+
+  await callTestHook(mobile, "startEra", 0);
+  state = await readState(mobile);
+  assertEndCondition(state, ["collect"], "mobile collect HUD");
+  await callTestHook(mobile, "completeEra");
+  await assertOverlayMessaging(mobile, "eraClear", [/거대 코어/, /시대 점수/, /다음 시대로/], "mobile");
+  await mobile.screenshot({ path: new URL("mobile-era-clear.png", outputDir).pathname, fullPage: true });
+  checks.push("mobile era-clear overlay preserves boss and scoring messaging");
+
+  await callTestHook(mobile, "startEra", 4);
+  await callTestHook(mobile, "completeEra");
+  state = await readState(mobile);
+  assertEndCondition(state, ["finalVictory"], "mobile final victory HUD");
+  await assertOverlayMessaging(mobile, "victory", [/시간 구슬/, /거대 목표/, /다시 시간여행/], "mobile");
+  await mobile.screenshot({ path: new URL("mobile-victory.png", outputDir).pathname, fullPage: true });
+  checks.push("mobile final victory overlay preserves explicit final messaging");
   await mobile.close();
 } finally {
   await browser.close();

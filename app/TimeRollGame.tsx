@@ -118,6 +118,34 @@ type Particle = {
   color: [number, number, number];
 };
 
+type PickupFeedback = {
+  sequence: number;
+  life: number;
+  duration: number;
+  x: number;
+  z: number;
+  itemName: string;
+  theme: ThemeId;
+  gainedScore: number;
+  combo: number;
+  sizeUp: boolean;
+  special: boolean;
+};
+
+type EndConditionSnapshot = {
+  phase: "collect" | "boss" | "eraComplete" | "finalVictory";
+  focusLabel: string;
+  collected: number;
+  required: number;
+  remaining: number;
+  targetName: string;
+  step1Done: boolean;
+  step2Done: boolean;
+  finalEra: boolean;
+  label: string;
+  summary: string;
+};
+
 type GameState = {
   mode: GameMode;
   era: number;
@@ -157,6 +185,7 @@ type GameState = {
   comboTimer: number;
   lastCollection: string;
   blockedCollision: string;
+  pickupFeedback: PickupFeedback | null;
 };
 
 type HudSnapshot = {
@@ -187,6 +216,8 @@ type HudSnapshot = {
   eraScore: number;
   lastCollection: string;
   blockedCollision: string;
+  pickupFeedback: PickupFeedback | null;
+  endCondition: EndConditionSnapshot;
   bestEra: number;
   bestSize: number;
 };
@@ -232,6 +263,7 @@ declare global {
       setCameraHeading: (headingRadians: number) => void;
       setCameraPose: (eye: Vec3, target: Vec3, fovDegrees?: number) => void;
       setPlayerPosition: (x: number, z: number) => void;
+      setTimer: (seconds: number) => void;
       getState: () => string;
     };
   }
@@ -1885,11 +1917,49 @@ function createState(
     comboTimer: 0,
     lastCollection: "",
     blockedCollision: "",
+    pickupFeedback: null,
   };
 }
 
 function formatSize(radius: number, era: number) {
   return formatPhysicalSize(radius, era).replace("약 ", "");
+}
+
+function getEndCondition(state: GameState, bossName: string): EndConditionSnapshot {
+  const era = ERAS[state.era];
+  const focusLabel = THEME_BY_ID[era.focus].label;
+  const collected = Math.min(state.eraCollected, era.goal);
+  const remaining = Math.max(0, era.goal - state.eraCollected);
+  const boss = state.items.find((item) => item.special);
+  const step1Done = state.bossReady || collected >= era.goal;
+  const step2Done = !!boss?.collected;
+  const finalEra = state.era === ERAS.length - 1;
+  const targetName = bossName || "거대 시간 코어";
+  let phase: EndConditionSnapshot["phase"] = "collect";
+  let summary = `${focusLabel} 물건 ${remaining}개 더 모은 뒤 ${targetName} 붙이기`;
+
+  if (step2Done) {
+    phase = finalEra ? "finalVictory" : "eraComplete";
+    summary = finalEra ? "최종 코어 수집 완료 · 게임 완료" : "거대 코어 수집 완료 · 시대 완료";
+  } else if (step1Done) {
+    phase = "boss";
+    const completionLabel = finalEra ? "게임 최종 완료" : "시대 완료";
+    summary = `${targetName}을 시간 안에 붙이면 ${completionLabel}`;
+  }
+
+  return {
+    phase,
+    focusLabel,
+    collected,
+    required: era.goal,
+    remaining,
+    targetName,
+    step1Done,
+    step2Done,
+    finalEra,
+    label: summary,
+    summary,
+  };
 }
 
 function makeHud(state: GameState, bestEra: number, bestSize: number): HudSnapshot {
@@ -1908,6 +1978,7 @@ function makeHud(state: GameState, bestEra: number, bestSize: number): HudSnapsh
   const next = getNextTier(state.radius, ERAS[state.era].baseRadius);
   const boss = state.items.find((item) => item.special);
   const canCollect = !!nearest && canCollectByRule(state, nearest, state.bossReady);
+  const bossName = boss?.name ?? "";
   return {
     mode: state.mode,
     era: state.era,
@@ -1930,7 +2001,7 @@ function makeHud(state: GameState, bestEra: number, bestSize: number): HudSnapsh
     nextCollectSize: next
       ? `${Math.round(next.itemRadiusRangeRatio[0] * 100)}-${Math.round(next.itemRadiusRangeRatio[1] * 100)}%`
       : "거대 목표",
-    bossName: boss?.name ?? "",
+    bossName,
     bossCollected: !!boss?.collected,
     score: state.score,
     combo: state.combo,
@@ -1938,6 +2009,8 @@ function makeHud(state: GameState, bestEra: number, bestSize: number): HudSnapsh
     eraScore: state.eraScore,
     lastCollection: state.lastCollection,
     blockedCollision: state.blockedCollision,
+    pickupFeedback: state.pickupFeedback ? { ...state.pickupFeedback } : null,
+    endCondition: getEndCondition(state, bossName),
     bestEra,
     bestSize,
   };
@@ -3414,37 +3487,101 @@ function drawItem(
   }
 }
 
-function drawRobot(
-  renderer: WebGlToyRenderer,
-  state: GameState,
-  time: number,
-  heading: number,
-) {
+type RobotKinematics = {
+  scale: number;
+  speed01: number;
+  travelPhase: number;
+  stride: number;
+  lean: number;
+  center: Vec3;
+  leftShoulder: Vec3;
+  rightShoulder: Vec3;
+  leftElbow: Vec3;
+  rightElbow: Vec3;
+  leftHand: Vec3;
+  rightHand: Vec3;
+};
+
+function getRobotKinematics(state: GameState, heading: number, portrait: boolean): RobotKinematics {
   const radius = state.radius;
   const base = ERAS[state.era].baseRadius;
-  const robotScale = base * 0.43;
-  const r = robotScale;
+  const scale = base * 0.18;
   const speed01 = clamp(Math.hypot(state.vx, state.vz) / Math.max(base * 7.2, 0.01), 0, 1);
   const forwardX = Math.sin(heading);
   const forwardZ = -Math.cos(heading);
   const rightX = Math.cos(heading);
   const rightZ = Math.sin(heading);
-  const portrait = typeof window !== "undefined" && window.innerHeight > window.innerWidth * 1.12;
-  const sideOffset = portrait ? 0.62 : 0.76;
-  const centerX = state.x - forwardX * (radius + robotScale * 1.18) + rightX * robotScale * sideOffset;
-  const centerZ = state.z - forwardZ * (radius + robotScale * 1.18) + rightZ * robotScale * sideOffset;
-  const lean = speed01 * 0.1;
-  const meshYaw = robotMeshYaw(heading);
-  const stride = Math.sin(time * mix(5.2, 9.4, speed01)) * r * mix(0.05, 0.14, speed01);
+  const sideOffset = portrait ? 0.72 : 0.65;
+  const centerDistance = radius + scale * 1.06;
+  const centerX = state.x - forwardX * centerDistance + rightX * scale * sideOffset;
+  const centerZ = state.z - forwardZ * centerDistance + rightZ * scale * sideOffset;
+  const travelPhase = -(state.rollX * Math.cos(heading) + state.rollZ * Math.sin(heading));
+  const stride = Math.sin(travelPhase * 1.9) * scale * 0.14 * speed01;
+  const lean = 0.06 + speed01 * 0.34;
   const local = (x: number, y: number, z: number): Vec3 => [
     centerX + rightX * x + forwardX * z,
     y,
     centerZ + rightZ * x + forwardZ * z,
   ];
-  const ballContact = (x: number, y: number): Vec3 => [
-    state.x - forwardX * radius * 0.92 + rightX * x,
+  const contactSpread = Math.min(radius * 0.34, scale * 0.3);
+  const contactY = Math.min(radius * 1.38, Math.max(radius * 0.7, scale * 0.86));
+  const ballContact = (side: -1 | 1): Vec3 => {
+    const x = side * contactSpread;
+    const yOffset = contactY - radius;
+    const rearDepth = Math.sqrt(Math.max(
+      radius * radius - x * x - yOffset * yOffset,
+      radius * radius * 0.08,
+    ));
+    return [
+      state.x - forwardX * rearDepth + rightX * x,
+      contactY,
+      state.z - forwardZ * rearDepth + rightZ * x,
+    ];
+  };
+  const leftHand = ballContact(-1);
+  const rightHand = ballContact(1);
+  const leftShoulder = local(-scale * 0.58, scale * 1.08, scale * 0.42);
+  const rightShoulder = local(scale * 0.58, scale * 1.08, scale * 0.42);
+  const elbow = (shoulder: Vec3, hand: Vec3, side: -1 | 1): Vec3 => [
+    mix(shoulder[0], hand[0], 0.58) + forwardX * scale * 0.2 + rightX * side * scale * 0.035,
+    mix(shoulder[1], hand[1], 0.52) + scale * (0.03 + speed01 * 0.04),
+    mix(shoulder[2], hand[2], 0.58) + forwardZ * scale * 0.2 + rightZ * side * scale * 0.035,
+  ];
+  return {
+    scale,
+    speed01,
+    travelPhase,
+    stride,
+    lean,
+    center: [centerX, 0, centerZ],
+    leftShoulder,
+    rightShoulder,
+    leftElbow: elbow(leftShoulder, leftHand, -1),
+    rightElbow: elbow(rightShoulder, rightHand, 1),
+    leftHand,
+    rightHand,
+  };
+}
+
+function drawRobot(
+  renderer: WebGlToyRenderer,
+  state: GameState,
+  heading: number,
+) {
+  const portrait = typeof window !== "undefined" && window.innerHeight > window.innerWidth * 1.12;
+  const pose = getRobotKinematics(state, heading, portrait);
+  const r = pose.scale;
+  const forwardX = Math.sin(heading);
+  const forwardZ = -Math.cos(heading);
+  const rightX = Math.cos(heading);
+  const rightZ = Math.sin(heading);
+  const centerX = pose.center[0];
+  const centerZ = pose.center[2];
+  const meshYaw = robotMeshYaw(heading);
+  const local = (x: number, y: number, z: number): Vec3 => [
+    centerX + rightX * x + forwardX * z,
     y,
-    state.z - forwardZ * radius * 0.92 + rightZ * x,
+    centerZ + rightZ * x + forwardZ * z,
   ];
   const drawLimb = (from: Vec3, to: Vec3, thickness: number, color: Vec3, gloss = 0.45) => {
     const transform = segmentTransform(from, to, thickness);
@@ -3464,152 +3601,241 @@ function drawRobot(
   const shellColor: Vec3 = [0.09, 0.66, 0.78];
   const faceColor: Vec3 = [0.98, 0.95, 0.82];
   const jointColor: Vec3 = [0.055, 0.14, 0.18];
-  const armColor: Vec3 = [0.98, 0.68, 0.2];
-  drawContactShadow(renderer, centerX, centerZ, r * 1.1, 0.3, heading);
-  renderer.draw("roundedBox", bodyColor, local(0, r * 0.82, 0), [r * 0.95, r * 1.12, r * 0.82], [lean, meshYaw, 0], 1, 0.64, { skinTile: 3, textureBlend: 0.74, textureScale: [1.2, 1.5] });
-  renderer.draw("roundedBox", shellColor, local(0, r * 0.85, r * 0.49), [r * 0.72, r * 0.42, r * 0.18], [lean, meshYaw, 0], 1, 0.92, { skinTile: 5, textureBlend: 0.72 });
-  renderer.draw("sphere", [1, 0.88, 0.26], local(-r * 0.16, r * 0.88, r * 0.56), [r * 0.055, r * 0.065, r * 0.045], [0, 0, 0], 1, 0.96);
-  renderer.draw("sphere", [1, 0.88, 0.26], local(r * 0.16, r * 0.88, r * 0.56), [r * 0.055, r * 0.065, r * 0.045], [0, 0, 0], 1, 0.96);
-  renderer.draw("roundedBox", [0.045, 0.28, 0.34], local(0, r * 0.78, -r * 0.52), [r * 0.56, r * 0.68, r * 0.24], [lean, meshYaw, 0], 1, 0.84, { skinTile: 5, textureBlend: 0.72, textureScale: [1, 1.4] });
+  const armColor: Vec3 = [0.04, 0.8, 0.96];
+  if (state.lowQuality) {
+    drawContactShadow(renderer, centerX, centerZ, r * 1.02, 0.3, heading);
+    renderer.draw("roundedBox", bodyColor, local(0, r * 0.82, r * pose.lean * 0.3), [r * 0.86, r * 1.08, r * 0.72], [pose.lean, meshYaw, 0], 1, 0.64, { skinTile: 3, textureBlend: 0.72, textureScale: [1.2, 1.5] });
+    renderer.draw("roundedBox", faceColor, local(0, r * 1.54, r * 0.04), [r * 0.78, r * 0.62, r * 0.66], [pose.lean * 0.4, meshYaw, 0], 1, 0.82, { skinTile: 8, textureBlend: 0.5 });
+    renderer.draw("roundedBox", shellColor, local(0, r * 1.51, r * 0.39), [r * 0.48, r * 0.18, r * 0.065], [0, meshYaw, 0], 1, 0.96, { skinTile: 7, textureBlend: 0.58 });
+    drawLimb(pose.leftShoulder, pose.leftHand, r * 0.19, armColor, 0.82);
+    drawLimb(pose.rightShoulder, pose.rightHand, r * 0.19, armColor, 0.82);
+    renderer.draw("sphere", jointColor, pose.leftHand, [r * 0.17, r * 0.15, r * 0.13], [0, 0, 0], 1, 0.8);
+    renderer.draw("sphere", jointColor, pose.rightHand, [r * 0.17, r * 0.15, r * 0.13], [0, 0, 0], 1, 0.8);
+    renderer.draw("roundedBox", [0.08, 0.42, 0.5], local(-r * 0.22, r * 0.05, r * 0.1 + pose.stride), [r * 0.34, r * 0.13, r * 0.52], [0, meshYaw, 0], 1, 0.66, { skinTile: 5, textureBlend: 0.5 });
+    renderer.draw("roundedBox", [0.08, 0.42, 0.5], local(r * 0.22, r * 0.05, r * 0.1 - pose.stride), [r * 0.34, r * 0.13, r * 0.52], [0, meshYaw, 0], 1, 0.66, { skinTile: 5, textureBlend: 0.5 });
+    return;
+  }
+  drawContactShadow(renderer, centerX, centerZ, r * 1.02, 0.3, heading);
+  drawContactShadow(
+    renderer,
+    mix(centerX, state.x, 0.7),
+    mix(centerZ, state.z, 0.7),
+    Math.max(state.radius * 0.66, r * 0.5),
+    0.28 + pose.speed01 * 0.17,
+    heading,
+  );
+  renderer.draw("roundedBox", bodyColor, local(0, r * 0.82, r * pose.lean * 0.34), [r * 0.92, r * 1.12, r * 0.78], [pose.lean, meshYaw, 0], 1, 0.64, { skinTile: 3, textureBlend: 0.74, textureScale: [1.2, 1.5] });
+  renderer.draw("roundedBox", shellColor, local(0, r * 0.85, r * 0.47), [r * 0.68, r * 0.4, r * 0.14], [pose.lean, meshYaw, 0], 1, 0.92, { skinTile: 5, textureBlend: 0.72 });
+  renderer.draw("sphere", [1, 0.88, 0.26], local(-r * 0.15, r * 0.88, r * 0.54), [r * 0.055, r * 0.065, r * 0.045], [0, 0, 0], 1, 0.96);
+  renderer.draw("sphere", [1, 0.88, 0.26], local(r * 0.15, r * 0.88, r * 0.54), [r * 0.055, r * 0.065, r * 0.045], [0, 0, 0], 1, 0.96);
+  renderer.draw("roundedBox", [0.045, 0.28, 0.34], local(0, r * 0.78, -r * 0.49), [r * 0.52, r * 0.65, r * 0.2], [pose.lean, meshYaw, 0], 1, 0.84, { skinTile: 5, textureBlend: 0.72, textureScale: [1, 1.4] });
   if (!state.lowQuality) {
     for (const ventY of [0.62, 0.82, 1.02]) {
-      renderer.draw("roundedBox", [0.02, 0.09, 0.11], local(0, r * ventY, -r * 0.59), [r * 0.34, r * 0.045, r * 0.035], [0, meshYaw, 0], 1, 0.6, { skinTile: 5, textureBlend: 0.36 });
+      renderer.draw("roundedBox", [0.02, 0.09, 0.11], local(0, r * ventY, -r * 0.55), [r * 0.32, r * 0.045, r * 0.03], [0, meshYaw, 0], 1, 0.6, { skinTile: 5, textureBlend: 0.36 });
     }
   }
   for (const side of [-1, 1]) {
-    renderer.draw("capsule", [0.92, 0.66, 0.2], local(side * r * 0.66, r * 0.78, 0), [r * 0.24, r * 0.84, r * 0.24], [lean, meshYaw, 0], 1, 0.58, { skinTile: 3, textureBlend: 0.56 });
-    renderer.draw("sphere", jointColor, local(side * r * 0.62, r * 1.12, r * 0.1), [r * 0.24, r * 0.24, r * 0.24], [0, 0, 0], 1, 0.86);
-    renderer.draw("sphere", jointColor, local(side * r * 0.36, r * 0.32, r * 0.04), [r * 0.16, r * 0.16, r * 0.16], [0, 0, 0], 1, 0.82);
+    renderer.draw("sphere", shellColor, local(side * r * 0.62, r * 1.08, r * 0.12), [r * 0.23, r * 0.23, r * 0.23], [0, 0, 0], 1, 0.9);
+    renderer.draw("sphere", jointColor, local(side * r * 0.34, r * 0.31, r * 0.04), [r * 0.15, r * 0.15, r * 0.15], [0, 0, 0], 1, 0.82);
   }
-  renderer.draw("roundedBox", faceColor, local(0, r * 1.58, r * 0.05), [r * 0.86, r * 0.72, r * 0.78], [lean * 0.45, meshYaw, 0], 1, 0.84, { skinTile: 8, textureBlend: 0.52 });
-  renderer.draw("roundedBox", shellColor, local(0, r * 1.54, r * 0.46), [r * 0.56, r * 0.23, r * 0.09], [0, meshYaw, 0], 1, 0.98, { skinTile: 7, textureBlend: 0.6 });
-  renderer.draw("sphere", jointColor, local(-r * 0.2, r * 1.57, r * 0.52), [r * 0.085, r * 0.105, r * 0.075], [0, meshYaw, 0], 1, 0.94);
-  renderer.draw("sphere", jointColor, local(r * 0.2, r * 1.57, r * 0.52), [r * 0.085, r * 0.105, r * 0.075], [0, meshYaw, 0], 1, 0.94);
+  renderer.draw("roundedBox", faceColor, local(0, r * 1.55, r * 0.04), [r * 0.82, r * 0.68, r * 0.72], [pose.lean * 0.45, meshYaw, 0], 1, 0.84, { skinTile: 8, textureBlend: 0.52 });
+  renderer.draw("roundedBox", shellColor, local(0, r * 1.52, r * 0.42), [r * 0.52, r * 0.21, r * 0.075], [0, meshYaw, 0], 1, 0.98, { skinTile: 7, textureBlend: 0.6 });
+  renderer.draw("sphere", jointColor, local(-r * 0.19, r * 1.55, r * 0.47), [r * 0.08, r * 0.1, r * 0.07], [0, meshYaw, 0], 1, 0.94);
+  renderer.draw("sphere", jointColor, local(r * 0.19, r * 1.55, r * 0.47), [r * 0.08, r * 0.1, r * 0.07], [0, meshYaw, 0], 1, 0.94);
   if (!state.lowQuality) {
-    renderer.draw("capsule", shellColor, local(0, r * 1.98, -r * 0.14), [r * 0.13, r * 0.48, r * 0.13], [0, meshYaw, 0], 1, 0.78, { skinTile: 5, textureBlend: 0.62 });
-    renderer.draw("sphere", [1, 0.78, 0.18], local(0, r * 2.22, -r * 0.14), [r * 0.17, r * 0.17, r * 0.17], [0, 0, 0], 1, 0.94);
+    renderer.draw("capsule", shellColor, local(0, r * 1.93, -r * 0.12), [r * 0.12, r * 0.42, r * 0.12], [0, meshYaw, 0], 1, 0.78, { skinTile: 5, textureBlend: 0.62 });
+    renderer.draw("sphere", [1, 0.78, 0.18], local(0, r * 2.15, -r * 0.12), [r * 0.16, r * 0.16, r * 0.16], [0, 0, 0], 1, 0.94);
   }
 
-  const leftFoot = local(-r * 0.25, r * 0.23, -r * 0.1 + stride);
-  const rightFoot = local(r * 0.25, r * 0.23, -r * 0.1 - stride);
-  renderer.draw("capsule", [0.28, 0.7, 0.92], leftFoot, [r * 0.28, r * 0.62, r * 0.28], [0, meshYaw, 0.08], 1, 0.52, { skinTile: 4, textureBlend: 0.58 });
-  renderer.draw("capsule", [0.28, 0.7, 0.92], rightFoot, [r * 0.28, r * 0.62, r * 0.28], [0, meshYaw, -0.08], 1, 0.52, { skinTile: 4, textureBlend: 0.58 });
-  renderer.draw("roundedBox", [0.08, 0.42, 0.5], local(-r * 0.25, r * 0.05, r * 0.1 + stride), [r * 0.38, r * 0.14, r * 0.58], [0, meshYaw, 0], 1, 0.68, { skinTile: 5, textureBlend: 0.52 });
-  renderer.draw("roundedBox", [0.08, 0.42, 0.5], local(r * 0.25, r * 0.05, r * 0.1 - stride), [r * 0.38, r * 0.14, r * 0.58], [0, meshYaw, 0], 1, 0.68, { skinTile: 5, textureBlend: 0.52 });
+  const leftFoot = local(-r * 0.24, r * 0.22, -r * 0.08 + pose.stride);
+  const rightFoot = local(r * 0.24, r * 0.22, -r * 0.08 - pose.stride);
+  renderer.draw("capsule", [0.28, 0.7, 0.92], leftFoot, [r * 0.27, r * 0.6, r * 0.27], [0, meshYaw, 0.08], 1, 0.52, { skinTile: 4, textureBlend: 0.58 });
+  renderer.draw("capsule", [0.28, 0.7, 0.92], rightFoot, [r * 0.27, r * 0.6, r * 0.27], [0, meshYaw, -0.08], 1, 0.52, { skinTile: 4, textureBlend: 0.58 });
+  renderer.draw("roundedBox", [0.08, 0.42, 0.5], local(-r * 0.24, r * 0.05, r * 0.1 + pose.stride), [r * 0.36, r * 0.14, r * 0.56], [0, meshYaw, 0], 1, 0.68, { skinTile: 5, textureBlend: 0.52 });
+  renderer.draw("roundedBox", [0.08, 0.42, 0.5], local(r * 0.24, r * 0.05, r * 0.1 - pose.stride), [r * 0.36, r * 0.14, r * 0.56], [0, meshYaw, 0], 1, 0.68, { skinTile: 5, textureBlend: 0.52 });
 
-  const leftShoulder = local(-r * 0.78, r * 1.08, r * 0.2);
-  const rightShoulder = local(r * 0.78, r * 1.08, r * 0.2);
-  const leftHand = ballContact(-r * 0.72, radius * 1.05);
-  const rightHand = ballContact(r * 0.72, radius * 1.05);
-  drawLimb(leftShoulder, leftHand, r * 0.21, armColor);
-  drawLimb(rightShoulder, rightHand, r * 0.21, armColor);
-  const handleCenter = ballContact(0, radius * 1.03);
-  renderer.draw(
-    "roundedBox",
-    [0.12, 0.66, 0.82],
-    handleCenter,
-    [r * 1.34, r * 0.16, r * 0.18],
-    [0, meshYaw, 0],
-    1,
-    0.86,
-    { skinTile: 5, textureBlend: 0.34 },
-  );
-  renderer.draw(
-    "sphere",
-    [1, 0.82, 0.24],
-    handleCenter,
-    [r * 0.22, r * 0.22, r * 0.16],
-    [0, meshYaw, 0],
-    1,
-    0.94,
-  );
-  renderer.draw("sphere", [0.96, 0.42, 0.29], leftHand, [r * 0.22, r * 0.2, r * 0.22], [0, 0, 0], 1, 0.55);
-  renderer.draw("sphere", [0.96, 0.42, 0.29], rightHand, [r * 0.22, r * 0.2, r * 0.22], [0, 0, 0], 1, 0.55);
+  drawLimb(pose.leftShoulder, pose.leftElbow, r * 0.2, armColor, 0.82);
+  drawLimb(pose.leftElbow, pose.leftHand, r * 0.17, armColor, 0.86);
+  drawLimb(pose.rightShoulder, pose.rightElbow, r * 0.2, armColor, 0.82);
+  drawLimb(pose.rightElbow, pose.rightHand, r * 0.17, armColor, 0.86);
+  renderer.draw("sphere", [1, 0.74, 0.2], pose.leftElbow, [r * 0.17, r * 0.17, r * 0.17], [0, 0, 0], 1, 0.9);
+  renderer.draw("sphere", [1, 0.74, 0.2], pose.rightElbow, [r * 0.17, r * 0.17, r * 0.17], [0, 0, 0], 1, 0.9);
+  for (const hand of [pose.leftHand, pose.rightHand]) {
+    const normalX = (hand[0] - state.x) / state.radius;
+    const normalY = (hand[1] - state.radius) / state.radius;
+    const normalZ = (hand[2] - state.z) / state.radius;
+    const palmCenter: Vec3 = [
+      hand[0] + normalX * r * 0.035,
+      hand[1] + normalY * r * 0.035,
+      hand[2] + normalZ * r * 0.035,
+    ];
+    renderer.draw(
+      "roundedBox",
+      [0.14, 0.78, 0.9],
+      palmCenter,
+      [r * 0.24, r * 0.16, r * 0.09],
+      [pose.lean * 0.35, meshYaw, 0],
+      1,
+      0.64,
+      { skinTile: 3, textureBlend: 0.42 },
+    );
+    if (!state.reducedMotion) {
+      renderer.draw(
+        "sphere",
+        [1, 0.88, 0.3],
+        palmCenter,
+        [r * 0.28, r * 0.2, r * 0.12],
+        [0, 0, 0],
+        0.22 + pose.speed01 * 0.34,
+        0.98,
+      );
+      renderer.draw(
+        "sphere",
+        [0.1, 0.95, 1],
+        [hand[0] - normalX * r * 0.025, hand[1] - normalY * r * 0.025, hand[2] - normalZ * r * 0.025],
+        [r * 0.12, r * 0.09, r * 0.065],
+        [0, 0, 0],
+        0.26 + pose.speed01 * 0.22,
+        0.98,
+      );
+    }
+  }
 }
 
 function drawSpeedEffects(
   renderer: WebGlToyRenderer,
   state: GameState,
   camera: CameraState,
-  time: number,
 ) {
   if (state.lowQuality || state.reducedMotion || camera.speed01 < 0.16) return;
   const r = state.radius;
-  const forwardX = Math.sin(camera.heading);
-  const forwardZ = -Math.cos(camera.heading);
-  const rightX = Math.cos(camera.heading);
-  const rightZ = Math.sin(camera.heading);
-  const streakCount = state.lowQuality ? 2 : 6;
+  const speed = Math.hypot(state.vx, state.vz);
+  const movementHeading = speed > 0.001 ? Math.atan2(state.vx, -state.vz) : camera.heading;
+  const forwardX = Math.sin(movementHeading);
+  const forwardZ = -Math.cos(movementHeading);
+  const rightX = Math.cos(movementHeading);
+  const rightZ = Math.sin(movementHeading);
+  const streakCount = state.lowQuality ? 3 : 5;
   for (let index = 0; index < streakCount; index += 1) {
-    const distance = r * (1.8 + index * 1.05);
-    const side = Math.sin(time * 5 + index * 2.4) * r * (0.3 + index * 0.06);
-    const fade = camera.speed01 * (1 - index / (streakCount + 1)) * 0.3;
+    const distance = r * (1.15 + index * 0.72);
+    const side = (index % 2 === 0 ? -1 : 1) * r * (0.28 + index * 0.05);
+    const fade = camera.speed01 * (1 - index / (streakCount + 1)) * (state.lowQuality ? 0.34 : 0.42);
     renderer.draw(
       "sphere",
       mixColor([1.0, 0.80, 0.24], ERAS[state.era].sky, index / 8),
       [
         state.x - forwardX * distance + rightX * side,
-        r * mix(0.62, 0.18, index / 6),
+        r * 0.075,
         state.z - forwardZ * distance + rightZ * side,
       ],
-      [r * mix(0.55, 0.16, index / streakCount), r * 0.14, r * mix(0.9, 0.25, index / streakCount)],
-      [0, camera.heading, 0],
+      [r * mix(0.34, 0.14, index / streakCount), r * 0.055, r * mix(0.74, 0.26, index / streakCount)],
+      [0, movementHeading, 0],
       fade,
       0.72,
     );
   }
 }
 
-function drawBall(renderer: WebGlToyRenderer, state: GameState, time: number) {
+function drawPickupEffects(renderer: WebGlToyRenderer, state: GameState) {
+  const feedback = state.pickupFeedback;
+  if (!feedback || feedback.life <= 0 || state.reducedMotion) return;
   const r = state.radius;
-  const base = ERAS[state.era].baseRadius;
-  const halo = Math.max(r, base * (state.lowQuality ? 0.32 : 0.38));
+  const progress = clamp(1 - feedback.life / feedback.duration, 0, 1);
+  const eased = 1 - Math.pow(1 - progress, 3);
+  const alpha = clamp(feedback.life / Math.min(feedback.duration, 0.36), 0, 1);
+  const color = THEME_BY_ID[feedback.theme].color;
+  const ringScale = r * mix(1.15, feedback.special ? 3.15 : 2.35, eased);
+  renderer.draw(
+    "torus",
+    mixColor(color, [1, 0.96, 0.56], 0.34),
+    [state.x, r * 0.12, state.z],
+    [ringScale, ringScale, ringScale],
+    [Math.PI / 2, state.rollZ * 0.18, 0],
+    alpha * (feedback.special ? 0.82 : 0.66),
+    0.98,
+  );
+  if (state.lowQuality) return;
+  renderer.draw(
+    "sphere",
+    [1, 0.97, 0.7],
+    [state.x, r, state.z],
+    [r * mix(2.22, 2.55, alpha), r * mix(2.22, 2.55, alpha), r * mix(2.22, 2.55, alpha)],
+    [state.rollX, state.rollZ, 0],
+    alpha * 0.28,
+    1,
+  );
+
+  const trailCount = state.lowQuality ? 2 : feedback.special ? 6 : 4;
+  for (let index = 0; index < trailCount; index += 1) {
+    const lag = index / Math.max(1, trailCount - 1) * 0.28;
+    const point = clamp(eased - lag, 0, 1);
+    const spiral = Math.sin((point + index * 0.23) * Math.PI * 3) * r * (1 - point) * 0.42;
+    const x = mix(feedback.x, state.x, point) + spiral;
+    const z = mix(feedback.z, state.z, point) - spiral * 0.45;
+    const size = r * mix(0.22, 0.09, index / Math.max(1, trailCount));
+    renderer.draw(
+      "sphere",
+      mixColor(color, [1, 1, 0.78], 0.42),
+      [x, mix(r * 0.35, r * 1.08, point), z],
+      [size, size, size],
+      [0, 0, 0],
+      alpha * mix(0.72, 0.24, index / Math.max(1, trailCount)),
+      0.96,
+    );
+  }
+}
+
+function drawBall(renderer: WebGlToyRenderer, state: GameState) {
+  const r = state.radius;
+  const halo = r;
   drawContactShadow(renderer, state.x, state.z, r * 1.18, 0.36, state.rollZ * 0.2);
   renderer.draw(
     "sphere",
-    [1, 0.78, 0.48],
+    [0.98, 0.66, 0.2],
     [state.x, r, state.z],
     [r * 2, r * 2, r * 2],
-    [state.rollX, time * 0.15, state.rollZ],
+    [state.rollX, -state.rollZ * 0.34, state.rollZ],
     1,
     0.9,
-    { skinTile: 0, textureBlend: 0.62, textureScale: 1.02 },
+    { skinTile: 0, textureBlend: 0.18, textureScale: 1.02 },
   );
-  renderer.draw(
-    "torus",
-    [0.98, 0.72, 0.22],
-    [state.x, r, state.z],
-    [halo * 2.16, halo * 2.16, halo * 2.16],
-    [Math.PI / 2 + state.rollX * 0.18, time * 0.22, state.rollZ * 0.18],
-    1,
-    0.9,
-    { skinTile: 3, textureBlend: 0.56, textureScale: 1.2 },
-  );
-  if (!state.lowQuality) {
+  if (state.growthRatio >= 0.24) {
+    renderer.draw(
+      "torus",
+      [0.98, 0.72, 0.22],
+      [state.x, r, state.z],
+      [halo * 2.16, halo * 2.16, halo * 2.16],
+      [Math.PI / 2 + state.rollX * 0.54, state.rollZ * 0.62, state.rollZ * 0.54],
+      1,
+      0.9,
+      { skinTile: 3, textureBlend: 0.12, textureScale: 1.2 },
+    );
+  }
+  if (!state.lowQuality && state.growthRatio >= 0.24) {
     renderer.draw(
       "torus",
       [0.16, 0.76, 0.86],
       [state.x, r, state.z],
       [halo * 1.68, halo * 1.68, halo * 1.68],
-      [state.rollX * 0.16, Math.PI / 2 + time * 0.18, state.rollZ * 0.16],
+      [-state.rollX * 0.46, Math.PI / 2 + state.rollZ * 0.72, state.rollZ * 0.28],
       1,
       0.84,
-      { skinTile: 5, textureBlend: 0.52, textureScale: 1.2 },
+      { skinTile: 5, textureBlend: 0.1, textureScale: 1.2 },
     );
   }
   renderer.draw(
     "sphere",
-    [1.0, 0.94, 0.62],
-    [state.x, r * 1.03, state.z],
-    [r * 2.08, r * 2.08, r * 2.08],
-    [state.rollX * 0.7, -time * 0.1, state.rollZ * 0.7],
-    0.12,
+    [1.0, 0.8, 0.3],
+    [state.x, r, state.z],
+    [r * 1.78, r * 1.78, r * 1.78],
+    [state.rollX * 0.72, state.rollZ * 0.48, state.rollZ * 0.72],
+    1,
     1,
   );
   const nodeCount = state.lowQuality ? 4 : 6;
   for (let node = 0; node < nodeCount; node += 1) {
-    const angle = (node / nodeCount) * Math.PI * 2 + time * 0.34;
-    const wave = Math.sin(angle * 2 + state.rollX) * halo * 0.14;
+    const angle = (node / nodeCount) * Math.PI * 2 + state.rollZ * 0.88;
+    const wave = Math.sin(angle * 2 + state.rollX * 1.15) * halo * 0.14;
     renderer.draw(
       "sphere",
       node % 2 === 0 ? [1, 0.86, 0.3] : [0.24, 0.88, 0.94],
@@ -3650,7 +3876,7 @@ function drawBall(renderer: WebGlToyRenderer, state: GameState, time: number) {
       THEME_BY_ID[attachment.theme].color,
       [x, y, z],
       [size, size, size],
-      [theta, phi + time * 0.06 + index * 0.1, theta * 0.4],
+      [theta + state.rollX * 0.2, phi + state.rollZ * 0.25 + index * 0.1, theta * 0.4 + state.rollX * 0.12],
       1,
       0.58,
       {
@@ -3671,7 +3897,7 @@ function visibleCollectibles(
   const forwardZ = -Math.cos(camera.heading);
   const rightX = Math.cos(camera.heading);
   const rightZ = Math.sin(camera.heading);
-  const hardBudget = state.lowQuality ? 12 : 42;
+  const hardBudget = state.lowQuality ? 7 : 42;
   const candidates: VisibleCollectible[] = [];
   const required: VisibleCollectible[] = [];
 
@@ -3801,9 +4027,10 @@ function drawWorld(
       0.94,
     );
   }
-  drawSpeedEffects(renderer, state, camera, visualTime);
-  drawBall(renderer, state, visualTime);
-  drawRobot(renderer, state, visualTime, camera.heading);
+  drawSpeedEffects(renderer, state, camera);
+  drawPickupEffects(renderer, state);
+  drawBall(renderer, state);
+  drawRobot(renderer, state, camera.heading);
   renderer.flushTransparent();
 }
 
@@ -3865,6 +4092,20 @@ export default function TimeRollGame() {
       eraScore: 0,
       lastCollection: "",
       blockedCollision: "",
+      pickupFeedback: null,
+      endCondition: {
+        phase: "collect",
+        focusLabel: THEME_BY_ID[ERAS[0].focus].label,
+        collected: 0,
+        required: ERAS[0].goal,
+        remaining: ERAS[0].goal,
+        targetName: "거대 물레방아",
+        step1Done: false,
+        step2Done: false,
+        finalEra: false,
+        label: `${THEME_BY_ID[ERAS[0].focus].label} 물건 ${ERAS[0].goal}개를 모은 뒤 거대 물레방아 붙이기`,
+        summary: `${THEME_BY_ID[ERAS[0].focus].label} 물건 ${ERAS[0].goal}개를 모은 뒤 거대 물레방아 붙이기`,
+      },
       bestEra: 0,
       bestSize: 0,
     }),
@@ -4012,12 +4253,15 @@ export default function TimeRollGame() {
       state.comboTimer = 0;
       state.lastCollection = "";
       state.blockedCollision = "";
+      state.pickupFeedback = null;
       updateGrowthState(state);
       resetCamera(camera, state);
       syncHud(true);
     };
 
     const collect = (item: Collectible) => {
+      const previousGrowthTier = state.growthTier;
+      const pickupOrigin = { x: item.x, z: item.z };
       item.collected = true;
       state.totalCollected += 1;
       state.themeTotals[item.theme] += 1;
@@ -4032,6 +4276,19 @@ export default function TimeRollGame() {
       state.eraScore += gainedScore;
       state.radius = absorbRadius(state, item, collectionMultiplier(item, ERAS[state.era].focus));
       updateGrowthState(state);
+      state.pickupFeedback = {
+        sequence: state.totalCollected,
+        life: item.special ? 1.2 : 0.82,
+        duration: item.special ? 1.2 : 0.82,
+        x: pickupOrigin.x,
+        z: pickupOrigin.z,
+        itemName: item.name,
+        theme: item.theme,
+        gainedScore,
+        combo: state.combo,
+        sizeUp: previousGrowthTier !== state.growthTier,
+        special: !!item.special,
+      };
       state.attachments.push({
         theme: item.theme,
         seed: item.id * 997 + state.era * 101,
@@ -4042,13 +4299,13 @@ export default function TimeRollGame() {
       state.collectedLabel = `${THEME_BY_ID[item.theme].label} · ${item.name}`;
       state.lastCollection = `${item.name} +${gainedScore}`;
       state.blockedCollision = "";
-      state.message = `${item.name} 모았어요!`;
+      state.message = `수집 성공! ${item.name}이 시간 구슬에 붙었어요`;
       state.messageTime = 1.6;
       state.shake = state.reducedMotion ? 0 : item.special ? 0.9 : 0.35;
       state.cameraKick = Math.max(state.cameraKick, item.special ? 1 : 0.42);
       if (!state.reducedMotion) {
         const random = seededRandom(item.id * 311 + state.totalCollected * 47);
-        const particleCount = state.lowQuality ? 3 : 10;
+        const particleCount = state.lowQuality ? (item.special ? 3 : 1) : item.special ? 18 : 12;
         for (let index = 0; index < particleCount; index += 1) {
           state.particles.push({
             x: item.x,
@@ -4057,12 +4314,13 @@ export default function TimeRollGame() {
             vx: (random() - 0.5) * state.radius * 3,
             vy: random() * state.radius * 3 + state.radius,
             vz: (random() - 0.5) * state.radius * 3,
-            life: 0.65,
+            life: state.lowQuality ? 0.5 : item.special ? 0.9 : 0.76,
             color: THEME_BY_ID[item.theme].color,
           });
         }
       }
       playTone(430 + state.era * 45, item.special ? 0.3 : 0.11, item.special ? 420 : 130);
+      playTone(690 + state.combo * 16, item.special ? 0.24 : 0.08, item.special ? 260 : 90);
 
       const era = ERAS[state.era];
       if (state.eraCollected >= era.goal && !state.bossReady) {
@@ -4095,6 +4353,10 @@ export default function TimeRollGame() {
     const update = (dt: number) => {
       const safeDt = clamp(dt, 0, 1 / 20);
       state.messageTime = Math.max(0, state.messageTime - safeDt);
+      if (state.pickupFeedback) {
+        state.pickupFeedback.life = Math.max(0, state.pickupFeedback.life - safeDt);
+        if (state.pickupFeedback.life <= 0) state.pickupFeedback = null;
+      }
       state.bumpCooldown = Math.max(0, state.bumpCooldown - safeDt);
       state.comboTimer = Math.max(0, state.comboTimer - safeDt);
       if (state.comboTimer === 0) state.combo = 0;
@@ -4186,18 +4448,15 @@ export default function TimeRollGame() {
           if (state.mode !== "playing") break;
         } else {
           const velocityLength = Math.hypot(state.vx, state.vz);
-          const normalX =
-            distance > 0.001
-              ? dx / distance
-              : velocityLength > 0.001
-                ? state.vx / velocityLength
-                : Math.sin(camera.heading);
-          const normalZ =
-            distance > 0.001
-              ? dz / distance
-              : velocityLength > 0.001
-                ? state.vz / velocityLength
-                : -Math.cos(camera.heading);
+          let normalX = Math.sin(camera.heading);
+          let normalZ = -Math.cos(camera.heading);
+          if (distance > 0.001) {
+            normalX = dx / distance;
+            normalZ = dz / distance;
+          } else if (velocityLength > 0.001) {
+            normalX = state.vx / velocityLength;
+            normalZ = state.vz / velocityLength;
+          }
           const overlap = collisionDistance - distance;
           state.x -= normalX * (overlap + state.radius * 0.04);
           state.z -= normalZ * (overlap + state.radius * 0.04);
@@ -4206,9 +4465,12 @@ export default function TimeRollGame() {
           if (state.bumpCooldown <= 0) {
             const neededRadius = requiredPlayerRadius(item);
             state.blockedCollision = item.name;
-            state.message = item.special && !state.bossReady
-              ? `${Math.max(0, ERAS[state.era].goal - state.eraCollected)}개 더 모으면 거대 목표를 열 수 있어요`
-              : `${item.name}은 아직 커요. ${formatSize(neededRadius, state.era)}까지 키워요!`;
+            if (item.special && !state.bossReady) {
+              const remainingFocusItems = Math.max(0, ERAS[state.era].goal - state.eraCollected);
+              state.message = `완료 조건 ①: ${THEME_BY_ID[ERAS[state.era].focus].label} 물건 ${remainingFocusItems}개를 더 모아야 해요`;
+            } else {
+              state.message = `${item.name}은 아직 커요 · 현재 ${formatSize(state.radius, state.era)} / 필요 ${formatSize(neededRadius, state.era)}`;
+            }
             state.messageTime = 2.2;
             state.bumpCooldown = 0.75;
             state.shake = state.reducedMotion ? 0 : 0.25;
@@ -4218,9 +4480,9 @@ export default function TimeRollGame() {
       }
 
       state.timer = Math.max(0, state.timer - safeDt);
-      if (state.timer <= 0) {
+      if (state.mode === "playing" && state.timer <= 0) {
         state.mode = "timeUp";
-        state.message = "조금만 더 굴려볼까요?";
+        state.message = "시간 종료 · 완료 조건을 달성하기 전에 시간이 끝났어요";
         state.messageTime = 20;
         persistProgress();
         playTone(280, 0.22, -100);
@@ -4251,6 +4513,24 @@ export default function TimeRollGame() {
         .slice(0, 10);
       const boss = state.items.find((item) => item.special);
       const renderStats = renderer.getRenderStats();
+      const endCondition = getEndCondition(state, boss?.name ?? "");
+      const portrait = canvas.clientHeight > canvas.clientWidth * 1.12;
+      const robotPose = getRobotKinematics(state, camera.heading, portrait);
+      const forwardX = Math.sin(camera.heading);
+      const forwardZ = -Math.cos(camera.heading);
+      const robotDx = robotPose.center[0] - state.x;
+      const robotDz = robotPose.center[2] - state.z;
+      const behindDistance = -(robotDx * forwardX + robotDz * forwardZ);
+      const handContactErrors = [robotPose.leftHand, robotPose.rightHand].map((hand) => (
+        Math.abs(Math.hypot(hand[0] - state.x, hand[1] - state.radius, hand[2] - state.z) - state.radius)
+      ));
+      const activePickup = state.pickupFeedback;
+      let feedbackKind = "none";
+      if (activePickup) {
+        feedbackKind = "success";
+      } else if (state.blockedCollision) {
+        feedbackKind = "blocked";
+      }
       return JSON.stringify({
         coordinateSystem: "ground plane x/z; x increases right, z decreases forward; y is up",
         mode: state.mode,
@@ -4269,6 +4549,10 @@ export default function TimeRollGame() {
           growthTier: state.growthTier,
           nextUnlockRatio: state.nextUnlockRatio,
           velocity: { x: Number(state.vx.toFixed(2)), z: Number(state.vz.toFixed(2)) },
+          roll: {
+            x: Number(state.rollX.toFixed(3)),
+            z: Number(state.rollZ.toFixed(3)),
+          },
         },
         score: state.score,
         combo: state.combo,
@@ -4299,6 +4583,19 @@ export default function TimeRollGame() {
           target: camera.target.map((value) => Number(value.toFixed(2))),
         },
         playerFraming: playerFramingSnapshot(state, camera, canvas),
+        debugRobot: {
+          center: {
+            x: Number(robotPose.center[0].toFixed(3)),
+            z: Number(robotPose.center[2].toFixed(3)),
+          },
+          distanceFromBall: Number(Math.hypot(robotDx, robotDz).toFixed(3)),
+          behindDistance: Number(behindDistance.toFixed(3)),
+          behindBall: behindDistance > state.radius * 0.5,
+          handContactDistance: Number(Math.max(...handContactErrors).toFixed(4)),
+          handsAtContact: handContactErrors.every((error) => error <= Math.max(state.radius * 0.025, 0.001)),
+          speed01: Number(robotPose.speed01.toFixed(3)),
+          travelPhase: Number(robotPose.travelPhase.toFixed(3)),
+        },
         renderStats: {
           drawCalls: renderStats.drawCalls,
           triangles: Math.round(renderStats.triangles),
@@ -4321,6 +4618,25 @@ export default function TimeRollGame() {
               }
             : null,
           finalReady: state.finalReady,
+        },
+        endCondition,
+        feedback: {
+          kind: feedbackKind,
+          success: !!activePickup,
+          successFxActive: !!activePickup && !state.reducedMotion,
+          callout: activePickup
+            ? `수집 성공! ${THEME_BY_ID[activePickup.theme].label} · ${activePickup.itemName} +${activePickup.gainedScore}`
+            : "",
+          itemName: activePickup?.itemName ?? "",
+          theme: activePickup ? THEME_BY_ID[activePickup.theme].label : "",
+          sizeUp: activePickup?.sizeUp ?? false,
+          life: Number((activePickup?.life ?? 0).toFixed(3)),
+          message: state.message,
+          messageTime: Number(state.messageTime.toFixed(2)),
+          collectedLabel: state.collectedLabel,
+          particleCount: state.particles.length,
+          shake: Number(state.shake.toFixed(2)),
+          cameraKick: Number(state.cameraKick.toFixed(2)),
         },
         blockedCollision: state.blockedCollision,
         lastCollection: state.lastCollection,
@@ -4485,6 +4801,10 @@ export default function TimeRollGame() {
           drawWorld(renderer, state, camera, performance.now() / 1000);
           syncHud(true);
         },
+        setTimer: (seconds: number) => {
+          state.timer = Math.max(0, Number(seconds) || 0);
+          syncHud(true);
+        },
         getState: getTextState,
       };
     }
@@ -4571,6 +4891,12 @@ export default function TimeRollGame() {
   const progress = clamp(hud.eraCollected / era.goal, 0, 1);
   const cappedEraCollected = Math.min(hud.eraCollected, era.goal);
   const timerProgress = clamp(hud.timer / era.seconds, 0, 1);
+  let finishStep2Class = "finish-step";
+  if (hud.endCondition.step2Done) {
+    finishStep2Class += " is-done";
+  } else if (hud.endCondition.step1Done) {
+    finishStep2Class += " is-active";
+  }
 
   const toggleFullscreen = useCallback(() => {
     if (!document.fullscreenElement) {
@@ -4695,6 +5021,27 @@ export default function TimeRollGame() {
           </div>
         </div>
 
+        <div
+          className={`finish-rule is-${hud.endCondition.phase}`}
+          data-testid="end-condition"
+          aria-label={`게임 종료 조건: ${hud.endCondition.summary}. 남은 시간 ${Math.ceil(hud.timer)}초`}
+        >
+          <div className="finish-rule-head">
+            <strong>게임 종료 조건</strong>
+            <span>{Math.ceil(hud.timer)}초 안에</span>
+          </div>
+          <div className={`finish-step ${hud.endCondition.step1Done ? "is-done" : "is-active"}`}>
+            <b>1</b>
+            <span>{hud.endCondition.focusLabel} 물건</span>
+            <em>{hud.endCondition.collected}/{hud.endCondition.required}</em>
+          </div>
+          <div className={finishStep2Class}>
+            <b>2</b>
+            <span>{hud.endCondition.targetName} 붙이기</span>
+            <em>{hud.endCondition.finalEra ? "게임 완료" : "시대 완료"}</em>
+          </div>
+        </div>
+
         <div className="score-strip" aria-label={`점수 ${hud.score}점 콤보 ${hud.combo}`}>
           <span>점수 <strong>{hud.score.toLocaleString("ko-KR")}</strong></span>
           <span>콤보 <strong>{hud.combo}</strong></span>
@@ -4704,7 +5051,7 @@ export default function TimeRollGame() {
         <div className="theme-strip" aria-label="주제별 수집 수">
           {THEMES.map((theme) => (
             <div
-              className={`theme-chip ${theme.id === era.focus ? "is-focus" : ""}`}
+              className={`theme-chip ${theme.id === era.focus ? "is-focus" : ""} ${hud.pickupFeedback?.theme === theme.id ? "is-pickup" : ""}`}
               key={theme.id}
             >
               <span style={{ backgroundColor: `rgb(${theme.color.map((v) => Math.round(v * 255)).join(",")})` }}>{theme.icon}</span>
@@ -4745,6 +5092,27 @@ export default function TimeRollGame() {
         {hud.message ? (
           <div className="game-message" role="status" aria-live="polite">
             {hud.message}
+          </div>
+        ) : null}
+
+        {hud.pickupFeedback && hud.pickupFeedback.life > 0 && hud.mode === "playing" ? (
+          <div
+            className={`pickup-callout ${hud.pickupFeedback.sizeUp ? "is-size-up" : ""}`}
+            key={hud.pickupFeedback.sequence}
+            aria-hidden="true"
+          >
+            <span
+              className="pickup-category"
+              style={{ backgroundColor: `rgb(${THEME_BY_ID[hud.pickupFeedback.theme].color.map((value) => Math.round(value * 255)).join(",")})` }}
+            >
+              {THEME_BY_ID[hud.pickupFeedback.theme].icon} {THEME_BY_ID[hud.pickupFeedback.theme].label}
+            </span>
+            <strong>수집 성공!</strong>
+            <b>{hud.pickupFeedback.itemName}</b>
+            <em>
+              +{hud.pickupFeedback.gainedScore.toLocaleString("ko-KR")}점 · {hud.pickupFeedback.combo} 콤보
+              {hud.pickupFeedback.sizeUp ? " · 크기 UP!" : ""}
+            </em>
           </div>
         ) : null}
 
@@ -4910,8 +5278,11 @@ export default function TimeRollGame() {
         <section className="game-overlay compact-overlay" aria-labelledby="timeup-title">
           <div className="result-panel">
             <p className="eyebrow">이번 기록 {hud.eraCollected} / {era.goal}</p>
-            <h2 id="timeup-title">조금만 더 굴려볼까요?</h2>
-            <p>모은 방법은 이미 알았어요. 같은 시대를 바로 다시 도전할 수 있어요.</p>
+            <h2 id="timeup-title">시간 종료</h2>
+            <p>
+              완료 조건을 달성하기 전에 시간이 끝났어요. 조금만 더 굴려볼까요?
+              {" "}{hud.endCondition.summary}.
+            </p>
             <button type="button" className="primary-button" onClick={() => actionsRef.current?.retryEra()}>
               <span>이 시대 다시 도전</span><b>↻</b>
             </button>
@@ -4952,8 +5323,12 @@ export default function TimeRollGame() {
         </section>
       ) : null}
 
-      <div className="sr-only" aria-live="polite" aria-atomic="true">
-        {hud.collectedLabel ? `${hud.collectedLabel} 수집` : ""}
+      <div className="sr-only pickup-callout-copy" aria-atomic="true">
+        {hud.pickupFeedback && hud.pickupFeedback.life > 0
+          ? `수집 성공! ${THEME_BY_ID[hud.pickupFeedback.theme].label} · ${hud.pickupFeedback.itemName} +${hud.pickupFeedback.gainedScore.toLocaleString("ko-KR")}점 ${hud.pickupFeedback.combo} 콤보${hud.pickupFeedback.sizeUp ? " 크기 UP" : ""}`
+          : hud.collectedLabel
+            ? `${hud.collectedLabel} 수집`
+            : ""}
       </div>
     </main>
   );
